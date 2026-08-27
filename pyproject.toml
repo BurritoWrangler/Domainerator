@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domainerator"
+version = "0.1.0"
+description = "Attack-path mapping for Windows Active Directory: correlate NetExec/Certipy/Impacket findings and BloodHound-CE ACL edges into ranked routes to Domain/Enterprise Admin"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Domainerator Contributors" }]
+keywords = [
+    "active-directory",
+    "penetration-testing",
+    "red-team",
+    "netexec",
+    "bloodhound",
+    "certipy",
+    "adcs",
+    "privilege-escalation",
+    "attack-paths",
+    "security",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+# Domainerator's runtime is pure standard library; it orchestrates external
+# CLI tools (netexec, certipy, impacket, bloodhound-python) installed
+# separately. See install.sh / the README.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/BurritoWrangler/Domainerator"
+Repository = "https://github.com/BurritoWrangler/Domainerator"
+Issues = "https://github.com/BurritoWrangler/Domainerator/issues"
+
+[project.scripts]
+domainerator = "domainerator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+domainerator = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # long lines are common in embedded command examples
+    "UP017",  # datetime.timezone.utc kept for broad interpreter portability
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

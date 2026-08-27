@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.egg
+.installed.cfg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# ---- Domainerator runtime artifacts (may contain sensitive engagement data) ----
+# BloodHound collection output
+bloodhound-output/
+*.bloodhound.zip
+20*_*.json
+20*_*.zip
+# Reports
+report.md
+report.json
+*-report.md
+*-report.json
+reports/
+# Engagement scope files (keep the sample, ignore real ones)
+*.scope
+!examples/*.scope
+# Cracking / loot inputs and outputs
+users.txt
+*.tgs
+*.hash
+*.pfx
+*.ccache

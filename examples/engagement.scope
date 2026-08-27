@@ -1,0 +1,13 @@
+# Domainerator scope file
+# One entry per line. Entries may be a single IP or a CIDR subnet.
+# Blank lines and lines starting with '#' are ignored.
+#
+# All testing is confined to hosts within these ranges; anything outside is
+# refused before any tool runs.
+
+# Example internal ranges
+10.0.0.0/24
+192.168.56.0/24
+
+# A single host (the domain controller)
+10.0.0.10

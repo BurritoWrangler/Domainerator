@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: Lint, build & test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q src
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Smoke test the installed CLI
+        run: |
+          domainerator --version
+          domainerator --help > /dev/null
+          # Dry-run with a scope confined to a test range; must exit cleanly.
+          printf '10.0.0.0/24\n' > /tmp/ci.scope
+          domainerator -t 10.0.0.10 -d corp.local --scope /tmp/ci.scope \
+            --dry-run --no-color --no-paths
