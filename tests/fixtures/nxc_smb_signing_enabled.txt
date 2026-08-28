@@ -1,0 +1,1 @@
+SMB         10.0.0.10    445    DC01    [*] Windows Server 2022 Build 20348 x64 (name:DC01) (domain:corp.local) (signing:True) (SMBv1:False)

@@ -73,6 +73,81 @@ def test_ranking_prefers_reliable_then_short():
     assert best.min_reliability == Reliability.GUARANTEED
 
 
+def test_webdav_relay_rbcd_chain_resolves():
+    """WebDAV host + LDAP relay target + machine account -> local admin via RBCD.
+
+    This exercises the baseline glue: WEBDAV_HOST + LOW_PRIV_USER -> coercion,
+    coercion + LDAP_RELAY_TARGET -> RBCD, RBCD + MACHINE_ACCOUNT -> local admin.
+    """
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    # Signals the new checks would emit:
+    eng.add_step(_step("webdav", "WebDAV-host",
+                       {Capability.UNAUTHENTICATED}, Capability.WEBDAV_HOST))
+    eng.add_step(_step("ldaprelay", "LDAP-relay-target",
+                       {Capability.UNAUTHENTICATED}, Capability.LDAP_RELAY_TARGET))
+    eng.add_step(_step("maq", "MAQ-abuse",
+                       {Capability.LOW_PRIV_USER}, Capability.MACHINE_ACCOUNT))
+
+    # LOCAL_ADMIN isn't a goal capability, so search for it explicitly.
+    got_local_admin = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.LOCAL_ADMIN],
+        max_depth=10,
+    )
+    assert got_local_admin, "WebDAV->relay->RBCD->local admin chain did not resolve"
+
+
+def test_nopac_chain_reaches_domain_admin():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("maq", "MAQ-abuse",
+                       {Capability.LOW_PRIV_USER}, Capability.MACHINE_ACCOUNT))
+    eng.add_step(_step("nopac", "noPac",
+                       {Capability.LOW_PRIV_USER, Capability.MACHINE_ACCOUNT},
+                       Capability.DCSYNC))
+    paths = eng.find_paths(starting_capabilities(authenticated=True), max_depth=10)
+    assert any(p.goal == Capability.DOMAIN_ADMIN for p in paths)
+
+
+def test_gpo_control_chain_reaches_local_admin():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("gpo", "WriteGPLink (GPO)",
+                       {Capability.LOW_PRIV_USER}, Capability.GPO_CONTROL))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.LOCAL_ADMIN],
+        max_depth=10,
+    )
+    assert got, "GPO control -> local admin chain did not resolve"
+
+
+def test_next_best_action_returns_first_actionable_step():
+    from domainerator.paths import next_best_action
+
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("kerb", "Kerberoast",
+                       {Capability.VALID_CREDENTIALS}, Capability.SPN_TGS))
+    eng.add_step(_step("crack", "Hash-crack",
+                       {Capability.SPN_TGS}, Capability.DCSYNC,
+                       reliability=Reliability.GUARANTEED))
+    paths = eng.find_paths(starting_capabilities(authenticated=True), max_depth=8)
+    held = starting_capabilities(authenticated=True)
+    action = next_best_action(paths, held)
+    assert action is not None
+    # The first actionable step must have its requirements already satisfied.
+    assert action.requires.issubset(held)
+    assert action.grants not in held
+
+
+def test_next_best_action_none_when_no_paths():
+    from domainerator.paths import next_best_action
+
+    assert next_best_action([], {Capability.UNAUTHENTICATED}) is None
+
+
 def test_attackpath_score_and_summary():
     steps = [
         _step("a", "A", {Capability.LOW_PRIV_USER}, Capability.DCSYNC),

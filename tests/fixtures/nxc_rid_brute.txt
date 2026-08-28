@@ -1,0 +1,6 @@
+SMB         10.0.0.10    445    DC01    [+] Guest account has empty password
+SMB         10.0.0.10    445    DC01    498: CORP\Enterprise Read-only Domain Controllers (SidTypeGroup)
+SMB         10.0.0.10    445    DC01    500: CORP\Administrator (SidTypeUser)
+SMB         10.0.0.10    445    DC01    1104: CORP\jsmith (SidTypeUser)
+SMB         10.0.0.10    445    DC01    1105: CORP\adunn (SidTypeUser)
+SMB         10.0.0.10    445    DC01    1106: CORP\svc_sql (SidTypeUser)

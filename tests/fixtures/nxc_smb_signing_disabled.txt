@@ -1,0 +1,1 @@
+SMB         10.0.0.10    445    DC01    [*] Windows Server 2019 Build 17763 x64 (name:DC01) (domain:corp.local) (signing:False) (SMBv1:False)

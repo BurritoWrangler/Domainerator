@@ -67,3 +67,30 @@ def test_unknown_edges_ignored(tmp_path):
 def test_missing_path_skipped():
     res = bh.ingest("/nonexistent/path/does/not/exist")
     assert res.skipped
+
+
+def test_gpo_control_edge(tmp_path):
+    # A GenericAll over a GPO object should grant GPO_CONTROL, not generic DACL.
+    doc = {
+        "meta": {"type": "gpos", "version": 5},
+        "data": [
+            {"Properties": {"name": "DEFAULT DOMAIN POLICY@CORP.LOCAL"},
+             "Aces": [{"RightName": "GenericAll", "PrincipalSID": "S-1-5-21-LOW"}]},
+        ],
+    }
+    res = bh.ingest(_write_ce(tmp_path, doc, name="gpos.json"))
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.GPO_CONTROL in grants
+
+
+def test_write_gplink_edge(tmp_path):
+    doc = {
+        "meta": {"type": "ous", "version": 5},
+        "data": [
+            {"Properties": {"name": "SERVERS-OU@CORP.LOCAL"},
+             "Aces": [{"RightName": "WriteGPLink", "PrincipalSID": "S-1-5-21-LOW"}]},
+        ],
+    }
+    res = bh.ingest(_write_ce(tmp_path, doc, name="ous.json"))
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.GPO_CONTROL in grants

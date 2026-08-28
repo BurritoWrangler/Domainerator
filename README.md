@@ -18,13 +18,37 @@ unauthenticated or low-privileged position up to **Domain Admin / Enterprise Adm
 It runs in two modes:
 
 - **Unauthenticated** — given just a target (and optionally a domain), it probes SMB
-  signing, NULL sessions, anonymous share/RID enumeration, LDAP anonymous bind, and
-  AS-REP roasting (with a userlist).
+  signing, NULL sessions, anonymous share/RID enumeration, LDAP anonymous bind, LDAP
+  signing / channel-binding relay exposure, WebDAV/WebClient discovery, and AS-REP
+  roasting (with a userlist).
 - **Authenticated** — given a domain, username, and password (or NT hash), it adds
   password-policy review, local-admin detection, Kerberoasting, delegation
-  enumeration, MachineAccountQuota, a full AD CS template audit (ESC1–ESC11), and
+  enumeration, active **RBCD enumeration**, **coercion-surface detection**
+  (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce), **noPac** (CVE-2021-42278/42287),
+  MachineAccountQuota, a full AD CS template audit (**ESC1–ESC16**), and
   **BloodHound-based ACL path analysis** (GenericAll, WriteDacl, ForceChangePassword,
-  AddMember, shadow credentials, RBCD, DCSync, and more).
+  AddMember, shadow credentials, RBCD, GPO abuse, DCSync, more).
+
+### RBCD and WebDAV / cross-protocol relay
+
+Beyond BloodHound's RBCD edges, Domainerator actively reads
+`msDS-AllowedToActOnBehalfOfOtherIdentity` across computer objects to surface existing
+RBCD relationships and where write access enables new ones. It also discovers hosts
+running the **WebClient (WebDAV)** service and checks whether the DC's LDAP lacks
+signing / channel binding — together these form the classic HTTP-coercion → relay-to-LDAP
+→ RBCD / shadow-credentials chain, which the path engine assembles automatically.
+
+### Coercion, noPac, ADCS ESC9–ESC16, and GPO abuse
+
+- **Coercion detection** probes MS-EFSR (PetitPotam), MS-RPRN (PrinterBug), MS-DFSNM
+  (DFSCoerce), and MS-FSRVP (ShadowCoerce), turning the coercion node in relay chains
+  from an assumption into a confirmed capability.
+- **noPac** (CVE-2021-42278/42287) is detected directly; combined with a creatable
+  machine account it is a high-reliability path to DCSync / Domain Admin.
+- **AD CS** coverage now spans **ESC1–ESC16** (adds ESC9/10/13/15/16), with the
+  exploitable ones producing certificate → PKINIT → DCSync path steps.
+- **GPO abuse**: control over a GPO (or `WriteGPLink` on an OU/site) becomes a
+  code-execution-on-linked-hosts hop toward local/Domain Admin.
 
 ## Detection and guidance only
 
@@ -182,9 +206,10 @@ Domainerator targets the **BloodHound-CE** JSON format (a top-level `data` array
 `AllExtendedRights`, `AddKeyCredentialLink` (shadow credentials), `AllowedToAct` and
 `AddAllowedToAct`/`WriteAccountRestrictions` (RBCD), `AllowedToDelegate`, `WriteSPN`
 (targeted Kerberoast), `ReadLAPSPassword`/`SyncLAPSPassword`, `ReadGMSAPassword`,
-`DumpSMSAPassword`, and `DCSync`/`GetChanges(All)`. Right names are matched
-case-insensitively. Edges terminating at high-value objects (Domain/Enterprise Admins,
-Domain Controllers, the built-in Administrator) become direct hops toward the goal.
+`DumpSMSAPassword`, `DCSync`/`GetChanges(All)`, and GPO abuse (`WriteGPLink`, plus
+full-control ACLs over GPO objects). Right names are matched case-insensitively. Edges
+terminating at high-value objects (Domain/Enterprise Admins, Domain Controllers, the
+built-in Administrator) become direct hops toward the goal.
 
 Collection uses `bloodhound-python -c DCOnly`, which queries only the domain controller
 (no fan-out to every workstation). This keeps collection compatible with a `--scope`
@@ -214,11 +239,53 @@ target / DC IP are validated up front so an out-of-scope target aborts immediate
 exit code 2. This makes it safe to point Domainerator at a DC while guaranteeing it never
 reaches beyond the agreed range.
 
+### Multiple targets & concurrency
+
+Scan a host list concurrently (respecting `--scope`), correlating findings from all
+hosts plus domain-wide BloodHound data into one path analysis:
+
+```bash
+domainerator -T hosts.txt -d corp.local -u alice -p 'S3cret!' \
+  --workers 8 --scope engagement.scope -o report.md
+```
+
+`hosts.txt` is one IP/host per line (`#` comments allowed). `--target` and `--targets`
+can be combined. If any target (or `--dc-ip`) is outside `--scope`, the run aborts before
+touching anything.
+
+### Trustworthy results: inconclusive state & tool inventory
+
+A check that runs but whose output shows a connection/auth failure — or whose expected
+signal is absent — is reported as **inconclusive**, not clean. This prevents a parser
+miss or an unreachable host from being read as "not vulnerable". The report also records
+a **tool inventory** (detected versions of nxc/certipy/impacket/bloodhound-python) so a
+parser miss can be correlated with a tool-version change.
+
+### Guided workflow: next best action & resume state
+
+- **Next best action.** From the ranked paths and your current capabilities, Domainerator
+  prints the single highest-value command to run next, so the workflow is step-by-step
+  rather than a wall of output.
+- **Resume state (`--state file.json`).** Persists discovered capabilities between runs.
+  After you manually gain something (crack a hash, obtain creds), add it to the state
+  file's `capabilities` (e.g. `"valid_credentials"`) and re-run: the path engine re-seeds
+  from your progress without redoing enumeration. This is the iterative
+  foothold → Domain Admin loop.
+
+```bash
+# first pass (unauth), saving state
+domainerator -t 10.0.0.10 -d corp.local --state engagement.state -o pass1.md
+# ... you crack an AS-REP hash and get creds; add "valid_credentials" to engagement.state
+# second pass (authed), re-seeded from state
+domainerator -t 10.0.0.10 -d corp.local -u alice -p 'S3cret!' --state engagement.state -o pass2.md
+```
+
 ### Key options
 
 | Option | Description |
 | --- | --- |
-| `-t, --target` | Target host/IP, usually a DC (required) |
+| `-t, --target` | Target host/IP, usually a DC |
+| `-T, --targets` | File of targets (one per line) to scan concurrently |
 | `-d, --domain` | AD domain (FQDN) |
 | `--dc-ip` | Domain controller IP (Kerberos/AD CS) |
 | `-u, --username` | Domain username (enables authenticated checks) |
@@ -233,6 +300,8 @@ reaches beyond the agreed range.
 | `--no-paths` | Disable attack-path correlation |
 | `--max-path-depth` | Max steps in a correlated path (default 8) |
 | `--scope` | Scope file (one IP/CIDR per line); confines all testing |
+| `--workers` | Concurrent workers when scanning multiple targets (default 5) |
+| `--state` | JSON state file: seeds known capabilities, updated with findings |
 | `--timeout` | Per-command timeout in seconds (default 300) |
 | `--dry-run` | Show commands without executing |
 | `-o, --output` | Write Markdown report to a file |
@@ -297,10 +366,13 @@ domainerator/
 ├── src/domainerator/
 │   ├── cli.py              # argument parsing + orchestration
 │   ├── runner.py           # tool execution, scope enforcement, Target model
+│   ├── scan.py             # per-target scan + concurrent multi-target scanning
+│   ├── state.py            # resume/state file (cross-run capabilities)
 │   ├── paths.py            # attack-graph model + best-first PathEngine
 │   ├── bloodhound.py       # BloodHound-CE collection/ingestion -> PathSteps
 │   ├── report.py           # JSON / Markdown / console rendering
 │   └── checks/             # unauthenticated, authenticated, adcs check modules
+├── tests/fixtures/         # captured tool outputs for parser regression tests
 ├── tests/                  # pytest suite (scope, bloodhound, paths)
 ├── examples/               # sample scope file
 ├── install.sh              # pipx-based installer for tool + dependencies
