@@ -89,6 +89,12 @@ class CheckResult:
     error: str | None = None
     skipped: bool = False
     skip_reason: str = ""
+    # Inconclusive: the tool ran successfully but its output did not match any
+    # known pattern, so we can neither confirm nor rule out the issue. This is
+    # deliberately distinct from "ran and found nothing" (clean) so a parser
+    # miss or a changed tool-output format is never read as all-clear.
+    inconclusive: bool = False
+    inconclusive_reason: str = ""
     # Attack-path steps this check contributes (typed as Any to avoid a circular
     # import with paths.py; populated with paths.PathStep instances).
     path_steps: list = field(default_factory=list)
@@ -99,6 +105,29 @@ class CheckResult:
     def add_step(self, step) -> None:
         """Attach a paths.PathStep discovered by this check."""
         self.path_steps.append(step)
+
+    def mark_inconclusive(self, reason: str) -> None:
+        """Flag that the tool ran but produced no interpretable signal.
+
+        Only meaningful when the check found nothing; if a finding was already
+        recorded the result is conclusive and this is a no-op.
+        """
+        if not self.findings:
+            self.inconclusive = True
+            self.inconclusive_reason = reason
+
+    @property
+    def status(self) -> str:
+        """One-word status for reporting."""
+        if self.skipped:
+            return "skipped"
+        if self.error:
+            return "error"
+        if self.findings:
+            return "findings"
+        if self.inconclusive:
+            return "inconclusive"
+        return "clean"
 
     @property
     def max_severity(self) -> Severity:
@@ -113,8 +142,11 @@ class CheckResult:
             "command": self.command,
             "return_code": self.return_code,
             "duration_seconds": round(self.duration_seconds, 2),
+            "status": self.status,
             "skipped": self.skipped,
             "skip_reason": self.skip_reason,
+            "inconclusive": self.inconclusive,
+            "inconclusive_reason": self.inconclusive_reason,
             "error": self.error,
             "findings": [f.to_dict() for f in self.findings],
             "raw_output": self.raw_output,
@@ -324,6 +356,41 @@ class ToolRunner:
 
     def is_available(self, name: str) -> bool:
         return self.find_tool(name) is not None
+
+    def get_version(self, name: str, version_args: tuple[str, ...] = ("--version",)) -> str | None:
+        """Best-effort version string for a tool, or None if unavailable.
+
+        Version flags are not standardized across these tools, so we try the
+        common ones and return the first non-empty line of output. This is for
+        the report's tool inventory, letting an operator correlate a parser
+        miss with a tool-version change; it is never used for logic.
+        """
+        if not self.is_available(name):
+            return None
+        # Version discovery is not scope-relevant (it hits no target), and it
+        # must work even in dry-run, so we bypass ToolRunner.run() here.
+        resolved = self.find_tool(name)
+        if resolved is None:
+            return None
+        import subprocess as _sp
+
+        for arg in version_args:
+            try:
+                proc = _sp.run(
+                    [resolved, arg],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+            except (OSError, _sp.TimeoutExpired):
+                continue
+            out = (proc.stdout or "") + (proc.stderr or "")
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    return line[:200]
+        return "unknown"
 
     @staticmethod
     def _redact(argv: list[str]) -> str:

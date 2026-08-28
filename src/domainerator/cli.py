@@ -27,9 +27,10 @@ from pathlib import Path
 
 from . import __version__, bloodhound
 from . import paths as paths_mod
-from .checks import adcs, authenticated, unauthenticated
 from .report import Report
 from .runner import CheckResult, Scope, ScopeError, Target, ToolRunner
+from .scan import ScanOptions, scan_targets
+from .state import State
 
 logger = logging.getLogger("domainerator")
 
@@ -51,8 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     tgt = parser.add_argument_group("target")
-    tgt.add_argument("-t", "--target", required=True,
+    tgt.add_argument("-t", "--target",
                      help="Target host/IP (typically a domain controller).")
+    tgt.add_argument("-T", "--targets",
+                     help="File of targets (one IP/host per line) to scan "
+                          "concurrently. Mutually complementary with --target.")
     tgt.add_argument("-d", "--domain", help="Active Directory domain (FQDN).")
     tgt.add_argument("--dc-ip", help="Domain controller IP (for Kerberos/AD CS).")
 
@@ -101,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
                           "hosts; out-of-scope targets are refused.")
     run.add_argument("--timeout", type=int, default=300,
                      help="Per-command timeout in seconds.")
+    run.add_argument("--workers", type=int, default=5,
+                     help="Concurrent workers when scanning multiple targets.")
+    run.add_argument("--state",
+                     help="Path to a JSON state file. Loaded to seed known "
+                          "capabilities and updated with what this run finds "
+                          "(supports the iterative foothold->DA workflow).")
     run.add_argument("--dry-run", action="store_true",
                      help="Show commands without executing them.")
     run.add_argument("-v", "--verbose", action="store_true",
@@ -142,6 +152,53 @@ def check_tooling(runner: ToolRunner) -> None:
                     "" if available else f"  (install: {hint})")
 
 
+def build_tool_inventory(runner: ToolRunner) -> dict[str, str | None]:
+    """Capture detected versions of the known tools for the report.
+
+    Recording versions lets an operator correlate a parser miss with a
+    tool-version change. Version discovery hits no target, so it is safe even
+    under scope and dry-run.
+    """
+    inventory: dict[str, str | None] = {}
+    for tool in KNOWN_TOOLS:
+        inventory[tool] = runner.get_version(tool) if runner.is_available(tool) else None
+    return inventory
+
+
+def load_targets(args: argparse.Namespace) -> list[str]:
+    """Collect target hosts from --target and/or --targets file."""
+    hosts: list[str] = []
+    if args.target:
+        hosts.append(args.target)
+    if args.targets:
+        text = Path(args.targets).read_text(encoding="utf-8")
+        for raw in text.splitlines():
+            entry = raw.strip()
+            if entry and not entry.startswith("#"):
+                hosts.append(entry)
+    # De-duplicate, preserve order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for h in hosts:
+        if h not in seen:
+            seen.add(h)
+            ordered.append(h)
+    return ordered
+
+
+def discovered_capabilities(results: list[CheckResult]) -> set:
+    """Union of all capabilities *granted* by path steps across results.
+
+    Used to persist to the state file so a subsequent run knows what this run
+    established (and to compute the next best action relative to progress).
+    """
+    caps = set()
+    for r in results:
+        for step in getattr(r, "path_steps", []) or []:
+            caps.add(step.grants)
+    return caps
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -149,6 +206,12 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="[%(levelname)s] %(message)s",
     )
+
+    # Determine targets from --target and/or --targets.
+    target_hosts = load_targets(args)
+    if not target_hosts:
+        print("error: provide --target and/or --targets", file=sys.stderr)
+        return 2
 
     # Load scope first so we can fail fast before touching anything.
     scope: Scope | None = None
@@ -159,26 +222,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: could not load scope file: {exc}", file=sys.stderr)
             return 2
         logger.info("scope active: %s", scope.describe())
-        for host_arg, label in ((args.target, "target"), (args.dc_ip, "dc-ip")):
+        # Every target and the dc-ip must be in scope; refuse the whole run
+        # otherwise so we never partially touch an out-of-scope host.
+        for host_arg in [*target_hosts, args.dc_ip]:
             if host_arg and not scope.contains(host_arg):
                 print(
-                    f"error: {label} '{host_arg}' is not within the scope "
-                    f"defined in {args.scope}. Refusing to run.",
+                    f"error: '{host_arg}' is not within the scope defined in "
+                    f"{args.scope}. Refusing to run.",
                     file=sys.stderr,
                 )
                 return 2
 
-    password = resolve_credentials(args)
+    # Load resume state (empty if absent).
+    state = State.load(args.state) if args.state else State()
 
-    target = Target(
-        host=args.target,
-        domain=args.domain,
-        username=args.username,
-        password=password,
-        nthash=args.nthash,
-        use_kerberos=args.kerberos,
-        dc_ip=args.dc_ip,
-    )
+    password = resolve_credentials(args)
 
     runner = ToolRunner(
         timeout=args.timeout,
@@ -189,64 +247,95 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verbose:
         check_tooling(runner)
+    tool_inventory = build_tool_inventory(runner)
 
-    results: list[CheckResult] = []
-
-    if not args.skip_unauth:
-        logger.info("running unauthenticated checks")
-        results += unauthenticated.run_all(
-            runner, target, timeout=args.timeout, userlist=args.userlist
+    authed_any = bool(args.username and (password or args.nthash))
+    targets = [
+        Target(
+            host=h,
+            domain=args.domain,
+            username=args.username,
+            password=password,
+            nthash=args.nthash,
+            use_kerberos=args.kerberos,
+            dc_ip=args.dc_ip,
         )
+        for h in target_hosts
+    ]
 
-    if target.authenticated:
-        if not args.skip_auth:
-            logger.info("running authenticated checks")
-            results += authenticated.run_all(runner, target, timeout=args.timeout)
-        if not args.skip_adcs:
-            logger.info("running AD CS checks")
-            results += adcs.run_all(runner, target, timeout=args.timeout)
-    else:
-        if not args.skip_auth or not args.skip_adcs:
-            logger.info("no credentials supplied; skipping authenticated and AD CS checks")
+    opts = ScanOptions(
+        timeout=args.timeout,
+        skip_unauth=args.skip_unauth,
+        skip_auth=args.skip_auth,
+        skip_adcs=args.skip_adcs,
+        userlist=args.userlist,
+    )
 
-    # BloodHound: optionally collect, then ingest whatever data we have.
+    logger.info("scanning %d target(s)", len(targets))
+    per_host = scan_targets(runner, targets, opts, max_workers=args.workers)
+
+    # BloodHound collection/ingestion is domain-wide -> done once, not per host.
+    bh_results: list[CheckResult] = []
     bh_data_path = args.bloodhound_data
     if args.bloodhound:
         logger.info("collecting BloodHound data")
+        # Use the first authenticated target for collection.
+        coll_target = next((t for t in targets if t.authenticated), targets[0])
         collect_result = bloodhound.collect(
-            runner, target, args.bloodhound_output, timeout=max(args.timeout, 600)
+            runner, coll_target, args.bloodhound_output, timeout=max(args.timeout, 600)
         )
-        results.append(collect_result)
-        # If we just collected and the operator didn't point us elsewhere,
-        # ingest from the collection output directory.
+        bh_results.append(collect_result)
         if not bh_data_path and not collect_result.skipped and not collect_result.error:
             bh_data_path = args.bloodhound_output
     if bh_data_path:
         logger.info("ingesting BloodHound data from %s", bh_data_path)
-        results.append(bloodhound.ingest(bh_data_path))
+        bh_results.append(bloodhound.ingest(bh_data_path))
 
-    # Correlate everything into ranked attack paths.
+    # Aggregate all results (per-host + domain-wide BloodHound) for correlation.
+    all_results: list[CheckResult] = []
+    for host_results in per_host.values():
+        all_results += host_results
+    all_results += bh_results
+
+    # Seed capabilities from starting posture + resume state.
+    start_caps = paths_mod.starting_capabilities(
+        authenticated=authed_any, is_low_priv=args.low_priv
+    )
+    start_caps |= state.seed_capabilities()
+
     attack_paths: list = []
+    next_action = None
     if not args.no_paths:
-        engine = paths_mod.build_engine(results)
-        start = paths_mod.starting_capabilities(
-            authenticated=target.authenticated,
-            is_low_priv=args.low_priv,
+        engine = paths_mod.build_engine(all_results)
+        attack_paths = engine.find_paths(start_caps, max_depth=args.max_path_depth)
+        next_action = paths_mod.next_best_action(attack_paths, start_caps)
+
+    # Persist discovered capabilities to the state file for the next run.
+    if args.state:
+        state.record_discovered(discovered_capabilities(all_results))
+        state.add_history(
+            f"{len(targets)} target(s): " + ", ".join(t.host for t in targets)
         )
-        attack_paths = engine.find_paths(start, max_depth=args.max_path_depth)
+        try:
+            state.save(args.state)
+        except OSError as exc:
+            logger.warning("could not write state file: %s", exc)
+
+    target_label = (
+        target_hosts[0] if len(target_hosts) == 1 else f"{len(target_hosts)} targets"
+    ) + (f" ({args.domain})" if args.domain else "")
 
     report = Report(
-        results,
-        target=f"{args.target}"
-        + (f" ({args.domain})" if args.domain else ""),
-        authenticated=target.authenticated,
+        all_results,
+        target=target_label,
+        authenticated=authed_any,
         attack_paths=attack_paths,
+        tool_inventory=tool_inventory,
+        next_action=next_action,
     )
 
-    # Console summary.
     print(report.console_summary(use_color=not args.no_color))
 
-    # File outputs.
     if args.output:
         Path(args.output).write_text(
             report.to_markdown(include_raw=args.include_raw), encoding="utf-8"

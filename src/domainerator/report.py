@@ -37,13 +37,22 @@ class Report:
         target: str = "",
         authenticated: bool = False,
         attack_paths: Iterable = (),
+        tool_inventory: dict | None = None,
+        next_action=None,
     ) -> None:
         self.results: list[CheckResult] = list(results)
         self.target = target
         self.authenticated = authenticated
         # List of paths.AttackPath (typed loosely to avoid a circular import).
         self.attack_paths: list = list(attack_paths)
+        # Mapping of tool name -> version string (or None if missing).
+        self.tool_inventory: dict = tool_inventory or {}
+        # A paths.PathStep representing the single highest-value next action.
+        self.next_action = next_action
         self.generated_at = datetime.now(timezone.utc)
+
+    def inconclusive_results(self) -> list[CheckResult]:
+        return [r for r in self.results if r.inconclusive]
 
     # -- aggregation helpers -------------------------------------------------
 
@@ -77,10 +86,13 @@ class Report:
             "summary": {
                 "checks_run": sum(1 for r in self.results if not r.skipped),
                 "checks_skipped": sum(1 for r in self.results if r.skipped),
+                "checks_inconclusive": len(self.inconclusive_results()),
                 "total_findings": len(self.all_findings()),
                 "severity_counts": self.severity_counts(),
                 "attack_paths_found": len(self.attack_paths),
             },
+            "tool_inventory": self.tool_inventory,
+            "next_action": self.next_action.to_dict() if self.next_action else None,
             "attack_paths": [p.to_dict() for p in self.attack_paths],
             "checks": [r.to_dict() for r in self.results],
         }
@@ -99,6 +111,18 @@ class Report:
         lines.append(f"- **Generated:** {self.generated_at.isoformat()}")
         lines.append("")
 
+        # Next best action - the headline guidance.
+        if self.next_action is not None:
+            step = self.next_action
+            lines.append("## Next best action")
+            lines.append("")
+            lines.append(f"**{step.technique}** — {step.description}")
+            lines.append("")
+            lines.append("```")
+            lines.append(step.command)
+            lines.append("```")
+            lines.append("")
+
         # Severity summary table.
         counts = self.severity_counts()
         lines.append("## Summary")
@@ -108,6 +132,14 @@ class Report:
         for sev in _SEVERITY_ORDER:
             lines.append(f"| {sev.label} | {counts[sev.label]} |")
         lines.append("")
+        inconclusive = self.inconclusive_results()
+        if inconclusive:
+            lines.append(
+                f"> **{len(inconclusive)} check(s) were inconclusive** (ran but "
+                "could not confirm or rule out the issue). These are **not** "
+                "clean results — see the checks section."
+            )
+            lines.append("")
 
         # Findings grouped by severity.
         findings = self._findings_sorted()
@@ -178,12 +210,14 @@ class Report:
         lines.append("## Checks executed")
         lines.append("")
         for result in self.results:
-            status = "skipped" if result.skipped else "ran"
+            status = result.status
             if result.error:
                 status = f"error: {result.error}"
             lines.append(f"- **{result.name}** ({result.category}) — {status}")
             if result.skipped and result.skip_reason:
                 lines.append(f"  - reason: {result.skip_reason}")
+            if result.inconclusive and result.inconclusive_reason:
+                lines.append(f"  - inconclusive: {result.inconclusive_reason}")
             if include_raw and result.raw_output:
                 lines.append("")
                 lines.append("  ```")
@@ -191,6 +225,17 @@ class Report:
                     lines.append(f"  {out_line}")
                 lines.append("  ```")
         lines.append("")
+
+        # Tool inventory - records detected versions so a parser miss can be
+        # correlated with a tool-version change.
+        if self.tool_inventory:
+            lines.append("## Tool inventory")
+            lines.append("")
+            lines.append("| Tool | Version |")
+            lines.append("| --- | --- |")
+            for tool, version in sorted(self.tool_inventory.items()):
+                lines.append(f"| {tool} | {version or 'not found'} |")
+            lines.append("")
 
         return "\n".join(lines)
 
@@ -243,6 +288,22 @@ class Report:
                 )
         else:
             lines.append(c("No complete escalation path identified.", "\033[90m"))
+
+        # Next best action - the single highest-value command to run next.
+        if self.next_action is not None:
+            step = self.next_action
+            lines.append("")
+            lines.append(c("Next best action:", bold) + f" {step.technique}")
+            lines.append(f"  {step.command}")
+
+        inconclusive = self.inconclusive_results()
+        if inconclusive:
+            lines.append("")
+            lines.append(c(
+                f"{len(inconclusive)} check(s) inconclusive (NOT clean):", "\033[93m"
+            ))
+            for r in inconclusive:
+                lines.append(f"  - {r.name}: {r.inconclusive_reason}")
 
         skipped = [r for r in self.results if r.skipped]
         if skipped:
