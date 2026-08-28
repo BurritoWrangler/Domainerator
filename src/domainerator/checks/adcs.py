@@ -32,6 +32,11 @@ ESC_PATH_GRANTS: dict[str, Capability] = {
     "ESC4": Capability.CERT_AS_DA,   # rewrite template to vulnerable then ESC1
     "ESC6": Capability.CERT_AS_DA,   # CA-wide SAN injection
     "ESC8": Capability.CERT_AS_DA,   # relay to web enrollment -> DC cert
+    "ESC9": Capability.CERT_AS_DA,   # no security ext -> cert mapping abuse
+    "ESC10": Capability.CERT_AS_DA,  # weak cert mapping -> impersonation
+    "ESC13": Capability.CERT_AS_DA,  # issuance policy linked to privileged group
+    "ESC15": Capability.CERT_AS_DA,  # EKUwu / arbitrary application policies
+    "ESC16": Capability.CERT_AS_DA,  # security-ext disabled CA-wide
 }
 
 # Map each ESC identifier to (severity, short human explanation, remediation).
@@ -105,6 +110,29 @@ ESC_INFO: dict[str, tuple[Severity, str, str]] = {
         "IF_ENFORCEENCRYPTICERTREQUEST not enforced, enabling RPC relay to the "
         "CA.",
         "Enable encryption enforcement for ICertPassage RPC requests.",
+    ),
+    "ESC13": (
+        Severity.HIGH,
+        "Template has an issuance policy linked (OID group link) to a "
+        "privileged group; enrolling grants that group's rights.",
+        "Remove group links from issuance policies or restrict enrollment on "
+        "affected templates.",
+    ),
+    "ESC15": (
+        Severity.CRITICAL,
+        "Schema V1 template allows attacker-supplied application policies "
+        "(EKUwu / CVE-2024-49019), enabling client-auth or enrollment-agent "
+        "abuse to impersonate privileged users.",
+        "Patch the CA (CVE-2024-49019), remove 'Supply in the request', and "
+        "retire V1 templates.",
+    ),
+    "ESC16": (
+        Severity.CRITICAL,
+        "The CA disables the szOID_NTDS_CA_SECURITY_EXT security extension "
+        "for all requests, enabling certificate-mapping impersonation "
+        "domain-wide.",
+        "Re-enable the security extension on the CA and enforce strong "
+        "certificate binding (KB5014754).",
     ),
 }
 

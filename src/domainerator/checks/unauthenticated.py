@@ -6,6 +6,8 @@ These checks probe a target the way an attacker with no foothold would:
 * NULL session and anonymous share enumeration
 * Anonymous RID cycling / user enumeration
 * LDAP anonymous bind
+* LDAP signing / channel-binding exposure (cross-protocol relay target)
+* WebDAV / WebClient service discovery (HTTP coercion source)
 * Kerberos pre-auth (AS-REP roastable accounts) when a userlist is known
 
 All commands are built as argument lists and executed via ``ToolRunner`` so no
@@ -18,7 +20,7 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import require_tool
+from . import looks_like_failure, require_tool
 
 CATEGORY = "unauthenticated"
 
@@ -44,6 +46,11 @@ def check_smb_signing(runner: ToolRunner, target: Target, timeout: int = 120) ->
     text = out.combined
     # netexec prints "signing:True" / "signing:False" on the banner line.
     m = re.search(r"signing:\s*(True|False)", text, re.IGNORECASE)
+    if not m:
+        result.mark_inconclusive(
+            "could not find SMB 'signing:' status in tool output (host "
+            "unreachable or output format changed)"
+        )
     if m:
         signing = m.group(1).lower() == "true"
         if not signing:
@@ -152,6 +159,13 @@ def check_null_session(runner: ToolRunner, target: Target, timeout: int = 120) -
                 ),
             )
         )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"no shares enumerated but output shows '{signal}' - NULL session "
+                "may have been refused rather than truly restricted"
+            )
     return result
 
 
@@ -173,7 +187,9 @@ def check_rid_cycling(runner: ToolRunner, target: Target, timeout: int = 180) ->
         result.error = out.error
         return result
 
-    users = re.findall(r"SidTypeUser\s+(\S+\\\S+)", out.combined)
+    # NetExec prints e.g. "1104: CORP\jsmith (SidTypeUser)" - the domain\user
+    # precedes the "(SidTypeUser)" tag.
+    users = re.findall(r"(\S+\\[^\s(]+)\s*\(SidTypeUser\)", out.combined)
     if users:
         result.add_finding(
             Finding(
@@ -230,6 +246,13 @@ def check_rid_cycling(runner: ToolRunner, target: Target, timeout: int = 180) ->
                 source="check",
             )
         )
+    else:
+        signal = looks_like_failure(out.combined)
+        if signal:
+            result.mark_inconclusive(
+                f"no users enumerated but output shows '{signal}' - RID cycling "
+                "may have been blocked rather than unavailable"
+            )
     return result
 
 
@@ -271,6 +294,96 @@ def check_ldap_anonymous_bind(
                 ),
             )
         )
+    else:
+        signal = looks_like_failure(out.combined)
+        if signal:
+            result.mark_inconclusive(
+                f"anonymous bind not confirmed and output shows '{signal}'"
+            )
+    return result
+
+
+def check_ldap_relay_exposure(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Check whether the DC's LDAP is a viable cross-protocol relay target.
+
+    LDAP signing not enforced and/or LDAPS channel binding not required means
+    coerced HTTP authentication (e.g. from a WebClient host) can be relayed to
+    LDAP(S) to write RBCD or shadow credentials. NetExec's ``ldap-checks``
+    module reports these settings.
+    """
+    name = "LDAP signing / channel-binding (relay exposure)"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    if target.authenticated:
+        auth = target.nxc_auth_args()
+    else:
+        auth = ["-u", "", "-p", ""]
+    argv = ["nxc", "ldap", target.host, *auth, "-M", "ldap-checks"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # ldap-checks reports lines like "LDAP Signing NOT Enforced" and
+    # "LDAPS Channel Binding is NOT set to Required".
+    signing_off = re.search(r"LDAP Signing\s+NOT\s+Enforced", text, re.IGNORECASE)
+    cb_off = re.search(r"Channel Binding.*NOT.*Require", text, re.IGNORECASE)
+    if signing_off or cb_off:
+        result.add_finding(
+            Finding(
+                title="LDAP relay protections not fully enforced",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "The DC does not fully enforce LDAP signing / LDAPS channel "
+                    "binding. Coerced NTLM authentication can be relayed to "
+                    "LDAP(S) to configure RBCD or add shadow credentials."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Enforce LDAP signing (require) and LDAPS channel binding "
+                    "(Extended Protection for Authentication) on all DCs."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="DC LDAP is a relay target",
+                technique="LDAP-relay-target",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.LDAP_RELAY_TARGET,
+                command=(
+                    f"nxc ldap {target.host} -u USER -p PASS -M ldap-checks  "
+                    "# signing/channel-binding not enforced"
+                ),
+                description=(
+                    "DC LDAP lacks signing/channel-binding enforcement, so "
+                    "coerced auth can be relayed to it."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        # ldap-checks explicitly reports enforcement; only inconclusive if the
+        # module output doesn't mention signing/channel-binding at all.
+        if not re.search(r"signing|channel binding", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "ldap-checks output did not report signing/channel-binding "
+                "status (module unavailable or output changed)"
+            )
     return result
 
 
@@ -377,6 +490,94 @@ def check_asrep_roast(
     return result
 
 
+def check_webdav(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Discover hosts running the WebClient (WebDAV) service.
+
+    A running WebClient service means the host can be coerced to authenticate
+    over HTTP. Unlike SMB, HTTP authentication can be relayed cross-protocol to
+    LDAP(S) on a DC that lacks channel binding, enabling RBCD or shadow-
+    credential attacks. This check uses NetExec's ``webdav`` module.
+
+    It runs with whatever credentials are available (a null session works in
+    some environments; supplied creds are used when present), so it is useful
+    both unauthenticated and authenticated.
+    """
+    name = "WebDAV / WebClient service discovery"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    # Use supplied creds when available, else a null session.
+    if target.authenticated:
+        auth = target.nxc_auth_args()
+    else:
+        auth = ["-u", "", "-p", ""]
+    argv = ["nxc", "smb", target.host, *auth, "-M", "webdav"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The webdav module reports when the WebClient service is running, e.g.
+    # "WEBDAV ... WebClient Service enabled on: <host>".
+    enabled = re.search(r"WebClient Service enabled", text, re.IGNORECASE) or re.search(
+        r"\bWEBDAV\b.*enabled", text, re.IGNORECASE
+    )
+    if enabled:
+        result.add_finding(
+            Finding(
+                title="WebClient (WebDAV) service enabled",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "The WebClient service is running on this host. It can be "
+                    "coerced to authenticate over HTTP, which is relayable to "
+                    "LDAP(S) (unlike SMB auth) to configure RBCD or add shadow "
+                    "credentials, leading to host/user takeover."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Disable the WebClient service where not required, enforce "
+                    "LDAP channel binding and signing on DCs, and enable EPA."
+                ),
+            )
+        )
+        # This host is a WebDAV/HTTP coercion source for cross-protocol relay.
+        result.add_step(
+            PathStep(
+                name="WebClient host enables HTTP coercion",
+                technique="WebDAV-host",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.WEBDAV_HOST,
+                command=(
+                    f"nxc smb {target.host} -u USER -p PASS -M webdav  "
+                    "# WebClient running -> HTTP-coercible"
+                ),
+                description=(
+                    "Host runs WebClient; usable as an HTTP coercion source for "
+                    "relay to LDAP."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"webdav|webclient", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "webdav module produced no WebClient status (module unavailable "
+                "or output changed)"
+            )
+    return result
+
+
 def run_all(
     runner: ToolRunner,
     target: Target,
@@ -389,5 +590,7 @@ def run_all(
         check_null_session(runner, target, timeout=min(timeout, 120)),
         check_rid_cycling(runner, target, timeout=min(timeout, 180)),
         check_ldap_anonymous_bind(runner, target, timeout=min(timeout, 120)),
+        check_ldap_relay_exposure(runner, target, timeout=min(timeout, 120)),
+        check_webdav(runner, target, timeout=min(timeout, 180)),
         check_asrep_roast(runner, target, userlist, timeout=timeout),
     ]

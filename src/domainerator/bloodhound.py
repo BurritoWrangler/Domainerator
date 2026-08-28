@@ -187,6 +187,25 @@ EDGE_MODEL: dict[str, tuple[Capability, str, Reliability, Noise, str, str]] = {
         "nxc ldap DC -u USER -p PASS --gmsa",
         "Can read the managed password of the target gMSA account.",
     ),
+    # --- GPO abuse edges ------------------------------------------------
+    # Control over a GPO (or the ability to link one) lets us run code on the
+    # computers/users the GPO applies to.
+    "WriteGPLink": (
+        Capability.GPO_CONTROL,
+        "WriteGPLink",
+        Reliability.HIGH,
+        Noise.MODERATE,
+        "# WriteGPLink on {target}: link a malicious GPO to this OU/site/domain",
+        "Can link GPOs to the target OU/site (WriteGPLink), enabling GPO abuse.",
+    ),
+    "GPOAppliesTo": (
+        Capability.GPO_CONTROL,
+        "GPO-Applies-To",
+        Reliability.HIGH,
+        Noise.MODERATE,
+        "# controlled GPO applies to {target}",
+        "A controlled GPO applies to the target; code runs on those principals.",
+    ),
     # --- BloodHound-CE specific / explicit edge names -------------------
     "SyncLAPSPassword": (
         Capability.LOCAL_ADMIN,
@@ -254,6 +273,8 @@ class BHEdge:
     right: str
     target: str
     target_is_high_value: bool
+    # BloodHound object type of the target ("gpos", "computers", ...) when known.
+    target_type: str = ""
 
 
 def _is_high_value(name: str) -> bool:
@@ -313,6 +334,8 @@ def _extract_edges_from_doc(doc: dict) -> list[BHEdge]:
     # BloodHound-CE (and 4.x legacy) wrap records under "data"; very old files
     # used top-level type keys. Support both. CE also carries a "meta" object
     # with a "type" field naming the object type in this file.
+    meta = doc.get("meta") or doc.get("Meta") or {}
+    obj_type = str(meta.get("type") or "").lower()
     records: list[dict] = []
     if isinstance(doc.get("data"), list):
         records = doc["data"]
@@ -320,6 +343,8 @@ def _extract_edges_from_doc(doc: dict) -> list[BHEdge]:
         for key in CE_KNOWN_TYPES:
             if isinstance(doc.get(key), list):
                 records.extend(doc[key])
+                if not obj_type:
+                    obj_type = key
 
     for obj in records:
         if not isinstance(obj, dict):
@@ -344,6 +369,7 @@ def _extract_edges_from_doc(doc: dict) -> list[BHEdge]:
                         right=right,
                         target=target_name,
                         target_is_high_value=target_hv,
+                        target_type=obj_type,
                     )
                 )
 
@@ -361,6 +387,7 @@ def _extract_edges_from_doc(doc: dict) -> list[BHEdge]:
                     right="MemberOf",
                     target=target_name,
                     target_is_high_value=target_hv,
+                    target_type=obj_type,
                 )
             )
 
@@ -373,6 +400,7 @@ def _extract_edges_from_doc(doc: dict) -> list[BHEdge]:
                     right="AllowedToAct",
                     target=target_name,
                     target_is_high_value=target_hv,
+                    target_type=obj_type,
                 )
             )
 
@@ -401,6 +429,15 @@ def _edge_to_step(edge: BHEdge) -> PathStep | None:
     if model is None:
         return None
     grant, technique, reliability, noise, cmd_tpl, desc = model
+
+    # A full-control right over a GPO object grants GPO_CONTROL (code execution
+    # on everything the GPO applies to), which the path engine turns into local
+    # admin. This reinterprets generic object-control edges when the target is
+    # a GPO.
+    if edge.target_type == "gpos" and grant == Capability.DACL_CONTROL:
+        grant = Capability.GPO_CONTROL
+        technique = f"{technique} (GPO)"
+        desc = "Control over a Group Policy Object. " + desc
 
     # A right over a high-value group/principal short-circuits toward the goal:
     # controlling Domain Admins (add member / reset a member) reaches DA.

