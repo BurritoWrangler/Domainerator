@@ -8,6 +8,8 @@ These checks probe a target the way an attacker with no foothold would:
 * LDAP anonymous bind
 * LDAP signing / channel-binding exposure (cross-protocol relay target)
 * WebDAV / WebClient service discovery (HTTP coercion source)
+* NTLMv1 acceptance (crackable / downgradable authentication)
+* NTLM reflection exposure (coerced auth relayable back to the same host)
 * Kerberos pre-auth (AS-REP roastable accounts) when a userlist is known
 
 All commands are built as argument lists and executed via ``ToolRunner`` so no
@@ -578,6 +580,244 @@ def check_webdav(runner: ToolRunner, target: Target, timeout: int = 180) -> Chec
     return result
 
 
+def check_ntlmv1(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
+    """Detect whether the host accepts legacy NTLMv1 authentication.
+
+    NTLMv1 responses are DES-based and crackable (e.g. via crack.sh / hashcat
+    -m 5500) to recover the NT hash, and are downgrade/relay-friendly. NetExec's
+    ``ntlmv1`` module reports the host's LmCompatibilityLevel posture.
+    """
+    name = "NTLMv1 authentication accepted"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    auth = target.nxc_auth_args() if target.authenticated else ["-u", "", "-p", ""]
+    argv = ["nxc", "smb", target.host, *auth, "-M", "ntlmv1"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The ntlmv1 module reports e.g. "NTLMv1 allowed / enabled" when vulnerable.
+    if re.search(r"NTLMv1.*(allow|enabl|vulnerab)", text, re.IGNORECASE) or re.search(
+        r"LmCompatibilityLevel.*(0|1|2)\b", text, re.IGNORECASE
+    ):
+        result.add_finding(
+            Finding(
+                title="NTLMv1 authentication accepted",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "The host permits NTLMv1. NTLMv1 net-NTLM responses are "
+                    "DES-based and can be cracked offline to recover the NT "
+                    "hash, and are easier to downgrade/relay."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Set LmCompatibilityLevel to 5 (send NTLMv2 only, refuse "
+                    "LM & NTLM) via Group Policy on all hosts."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Host accepts NTLMv1",
+                technique="NTLMv1",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NTLMV1_HOST,
+                command=f"nxc smb {target.host} -u '' -p '' -M ntlmv1",
+                description=(
+                    "Host negotiates NTLMv1; a coerced response can be cracked "
+                    "to the NT hash."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"ntlmv1|lmcompatibility", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "ntlmv1 module produced no NTLMv1/LmCompatibilityLevel status "
+                "(module unavailable or output changed)"
+            )
+    return result
+
+
+def check_ntlm_reflection(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Detect NTLM reflection exposure (coerced auth relayable to the same host).
+
+    When a host is vulnerable to NTLM reflection, coerced authentication can be
+    relayed back to the originating host to execute as it (local admin). NetExec
+    exposes this via its reflection module. Names/output vary across versions,
+    so parsing is deliberately tolerant.
+    """
+    name = "NTLM reflection exposure"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    auth = target.nxc_auth_args() if target.authenticated else ["-u", "", "-p", ""]
+    argv = ["nxc", "smb", target.host, *auth, "-M", "ntlm_reflection"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    if re.search(r"reflection.*(vulnerab|possible|allow)", text, re.IGNORECASE) or re.search(
+        r"\bVULNERABLE\b", text
+    ):
+        result.add_finding(
+            Finding(
+                title="Host vulnerable to NTLM reflection",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "Coerced authentication from this host can be relayed back "
+                    "to itself (NTLM reflection), granting privileged local "
+                    "access on the same host."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Apply the relevant patches (e.g. CVE-2025-33073 and related "
+                    "reflection fixes), enforce SMB signing, and restrict NTLM."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Host vulnerable to NTLM reflection",
+                technique="NTLM-Reflection-target",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.SELF_RELAY_TARGET,
+                command=f"nxc smb {target.host} -u '' -p '' -M ntlm_reflection",
+                description="Host reflects coerced auth back to itself.",
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"reflection", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "ntlm_reflection module produced no reflection status (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_timeroast(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Timeroasting: recover crackable computer-account hashes via NTP.
+
+    A DC's NTP service returns an authenticated response signed with the RID's
+    computer-account NT hash. Requesting these for enumerated RIDs yields
+    crackable machine-account hashes and needs **no domain credentials**, so
+    this runs in the shared phase both unauthenticated and authenticated;
+    supplied creds are used when present, otherwise a null session.
+    """
+    name = "Timeroasting (NTP computer-account hashes)"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    # Use supplied creds when available, else a null session.
+    if target.authenticated:
+        auth = target.nxc_auth_args()
+    else:
+        auth = ["-u", "", "-p", ""]
+    # NetExec's timeroast module queries the DC's NTP and emits hashcat hashes.
+    argv = ["nxc", "smb", target.host, *auth, "-M", "timeroast"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # Timeroast hashes are emitted in the hashcat -m 31300 "$sntp-ms$" format.
+    hashes = re.findall(r"\$sntp-ms\$\S+|\d+:\$sntp-ms\$\S+", text)
+    if hashes or re.search(r"timeroast|sntp-ms", text, re.IGNORECASE):
+        result.add_finding(
+            Finding(
+                title="Timeroastable computer-account hashes obtained",
+                severity=Severity.MEDIUM,
+                target=target.host,
+                description=(
+                    f"{len(hashes)} computer-account hash(es) were recovered via "
+                    "NTP timeroasting. These crack offline; a weak machine "
+                    "password yields the account's NT hash for further attacks."
+                ),
+                evidence="\n".join(h[:80] for h in hashes[:10]) or text[:600],
+                remediation=(
+                    "Timeroasting abuses legacy MS-SNTP authentication; restrict "
+                    "NTP where feasible and ensure machine passwords rotate."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Timeroast -> computer-account hash",
+                technique="Timeroast",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.CRACKABLE_HASH,
+                command=f"nxc smb {target.host} -M timeroast",
+                description="Recover crackable computer-account hashes via NTP.",
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                source="check",
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Crack timeroast hash -> credentials",
+                technique="Hash-crack",
+                requires=frozenset({Capability.CRACKABLE_HASH}),
+                grants=Capability.VALID_CREDENTIALS,
+                command="hashcat -m 31300 timeroast.hash wordlist.txt",
+                description=(
+                    "Crack the recovered computer-account hash offline; a weak "
+                    "machine password yields usable credentials."
+                ),
+                reliability=Reliability.SPECULATIVE,
+                noise=Noise.QUIET,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"timeroast inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"timeroast|sntp|ntp|no.*hash", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "timeroast module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
 def run_all(
     runner: ToolRunner,
     target: Target,
@@ -592,5 +832,8 @@ def run_all(
         check_ldap_anonymous_bind(runner, target, timeout=min(timeout, 120)),
         check_ldap_relay_exposure(runner, target, timeout=min(timeout, 120)),
         check_webdav(runner, target, timeout=min(timeout, 180)),
+        check_ntlmv1(runner, target, timeout=min(timeout, 120)),
+        check_ntlm_reflection(runner, target, timeout=min(timeout, 120)),
         check_asrep_roast(runner, target, userlist, timeout=timeout),
+        check_timeroast(runner, target, timeout=min(timeout, 180)),
     ]

@@ -66,6 +66,10 @@ class Capability(enum.Enum):
     WEBDAV_HOST = "webdav_host"                  # host running WebClient (HTTP coercion)
     LDAP_RELAY_TARGET = "ldap_relay_target"      # DC LDAP reachable for relay (no channel binding)
     GPO_CONTROL = "gpo_control"                  # write control over a GPO / its link
+    NTLMV1_HOST = "ntlmv1_host"                  # host accepting NTLMv1 (crackable/relayable)
+    SELF_RELAY_TARGET = "self_relay_target"      # host vulnerable to NTLM reflection
+    SCCM_MANAGEMENT_POINT = "sccm_management_point"  # discovered SCCM MP / site
+    SCCM_NAA_CREDS = "sccm_naa_creds"            # recovered SCCM Network Access Account creds
 
     # --- goals -----------------------------------------------------------
     DCSYNC = "dcsync"                            # can replicate secrets (near-DA)
@@ -486,6 +490,67 @@ def baseline_steps() -> list[PathStep]:
             ),
             reliability=Reliability.HIGH,
             noise=Noise.MODERATE,
+            source="baseline",
+        ),
+        # --- NTLMv1 glue -------------------------------------------------
+        # A host accepting NTLMv1 lets a coerced response be cracked (DES is
+        # weak) to recover the NT hash, or downgraded/relayed. Cracking the
+        # machine or user response yields usable credentials.
+        PathStep(
+            name="Coerce NTLMv1 response and crack -> credentials",
+            technique="NTLMv1-crack",
+            requires=frozenset({Capability.NTLMV1_HOST, Capability.COERCIBLE_AUTH}),
+            grants=Capability.CRACKABLE_HASH,
+            command=(
+                "# capture NTLMv1 net-ntlm from coerced auth, then crack via "
+                "crack.sh / hashcat -m 5500 (DES) to recover the NT hash"
+            ),
+            description=(
+                "A host negotiating NTLMv1 produces a DES-based response that "
+                "can be cracked to the NT hash, yielding reusable credentials."
+            ),
+            reliability=Reliability.MODERATE,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        # --- NTLM reflection glue ---------------------------------------
+        # A host vulnerable to NTLM reflection lets coerced auth be relayed back
+        # to itself (e.g. SMB->SMB or via the AuthN reflection flaw), granting
+        # privileged local access on that same host.
+        PathStep(
+            name="Reflect coerced auth back to the same host -> local admin",
+            technique="NTLM-Reflection",
+            requires=frozenset({Capability.SELF_RELAY_TARGET, Capability.COERCIBLE_AUTH}),
+            grants=Capability.LOCAL_ADMIN,
+            command=(
+                "ntlmrelayx.py -t SELF --no-smb-server ...  "
+                "# reflect coerced machine auth back to the originating host"
+            ),
+            description=(
+                "The host is vulnerable to NTLM reflection: coerced "
+                "authentication can be relayed back to the same host to execute "
+                "as it, granting local administrator access."
+            ),
+            reliability=Reliability.MODERATE,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        # --- SCCM / PXE NAA glue ----------------------------------------
+        # Recovered Network Access Account credentials are ordinary (often
+        # low-priv but domain-valid) credentials, a useful foothold.
+        PathStep(
+            name="SCCM NAA credentials -> domain foothold",
+            technique="SCCM-NAA",
+            requires=frozenset({Capability.SCCM_NAA_CREDS}),
+            grants=Capability.VALID_CREDENTIALS,
+            command="# use recovered NAA account as a domain credential",
+            description=(
+                "Network Access Account credentials recovered from SCCM (PXE "
+                "boot media or policy) are valid domain credentials usable as a "
+                "foothold."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.QUIET,
             source="baseline",
         ),
     ]

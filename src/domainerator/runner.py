@@ -24,6 +24,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -515,6 +516,148 @@ class ToolRunner:
             stderr=proc.stderr or "",
             duration_seconds=elapsed,
         )
+
+    def run_background(self, argv: list[str]) -> BackgroundProcess:
+        """Start ``argv`` as a long-running background process.
+
+        Unlike :meth:`run`, this returns immediately with a
+        :class:`BackgroundProcess` handle whose stdout/stderr are captured to a
+        thread-safe buffer. It is intended for listeners (e.g. ``ntlmrelayx``)
+        that must keep running while another command (a coercion trigger) is
+        fired against them.
+
+        Scope enforcement and dry-run behaviour mirror :meth:`run`. A refused or
+        missing-tool start yields a handle that is not ``alive`` and carries an
+        ``error`` string, so callers never have to distinguish a raised
+        exception from a failed launch.
+        """
+        if not argv:
+            raise ValueError("argv must not be empty")
+
+        display = self._redact(argv)
+        tool = argv[0]
+
+        if self.scope is not None and self.scope.active:
+            offending = self.scope.check_argv(argv)
+            if offending is not None:
+                return BackgroundProcess.failed(
+                    display,
+                    f"refused: target '{offending}' is outside the configured scope",
+                )
+
+        if self.verbose:
+            logger.info("starting background: %s", display)
+
+        if self.dry_run:
+            return BackgroundProcess.dry_run(display)
+
+        resolved = self.find_tool(tool)
+        if resolved is None:
+            return BackgroundProcess.failed(
+                display, f"tool '{tool}' not found on PATH"
+            )
+
+        try:
+            proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+                [resolved, *argv[1:]],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            return BackgroundProcess.failed(display, f"failed to start: {exc}")
+
+        return BackgroundProcess(command=display, process=proc)
+
+
+@dataclass
+class BackgroundProcess:
+    """A handle to a long-running child process with captured output.
+
+    Output is drained on a daemon thread into an internal buffer so a caller
+    can poll :meth:`read_new` without risking a pipe-buffer deadlock. Use
+    :meth:`stop` to terminate cleanly (SIGTERM, then SIGKILL on timeout).
+    """
+
+    command: str
+    process: subprocess.Popen | None = None
+    error: str | None = None
+    # Whole captured output so far.
+    _buffer: list[str] = field(default_factory=list)
+    _read_index: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _reader: threading.Thread | None = None
+    _dry_run: bool = False
+
+    def __post_init__(self) -> None:
+        if self.process is not None:
+            self._reader = threading.Thread(target=self._drain, daemon=True)
+            self._reader.start()
+
+    # --- constructors for non-started handles ---------------------------
+    @classmethod
+    def failed(cls, command: str, error: str) -> BackgroundProcess:
+        return cls(command=command, process=None, error=error)
+
+    @classmethod
+    def dry_run(cls, command: str) -> BackgroundProcess:
+        handle = cls(command=command, process=None)
+        handle._dry_run = True
+        handle._buffer.append("[dry-run] background process not started")
+        return handle
+
+    # --- lifecycle -------------------------------------------------------
+    def _drain(self) -> None:
+        assert self.process is not None
+        stream = self.process.stdout
+        if stream is None:
+            return
+        for line in stream:
+            with self._lock:
+                self._buffer.append(line.rstrip("\n"))
+
+    @property
+    def alive(self) -> bool:
+        """True while the process is running."""
+        if self._dry_run:
+            return False
+        if self.process is None:
+            return False
+        return self.process.poll() is None
+
+    @property
+    def started(self) -> bool:
+        """True if the process was actually launched (not refused/missing)."""
+        return self.process is not None or self._dry_run
+
+    def output(self) -> str:
+        """Return all captured output so far."""
+        with self._lock:
+            return "\n".join(self._buffer)
+
+    def read_new(self) -> str:
+        """Return output captured since the last call to :meth:`read_new`."""
+        with self._lock:
+            new = self._buffer[self._read_index:]
+            self._read_index = len(self._buffer)
+        return "\n".join(new)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Terminate the process (SIGTERM, then SIGKILL) and reap it."""
+        if self.process is None:
+            return
+        if self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            try:
+                self.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 @dataclass

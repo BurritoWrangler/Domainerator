@@ -44,6 +44,13 @@ report.json
 *-report.md
 *-report.json
 reports/
+# Evidence / engagement output folders (--output-dir); contain raw tool output
+# and recovered secrets. Ignore the timestamped run folders and common names.
+run-*/
+evidence/
+engagement/
+output/
+loot/
 # Engagement scope files (keep the sample, ignore real ones)
 *.scope
 !examples/*.scope

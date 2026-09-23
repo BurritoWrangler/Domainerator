@@ -23,9 +23,29 @@ its use. See `LICENSE` for the full terms.
 
 ## Design intent
 
-Domainerator is a **detection and guidance** tool. It does not exploit
-vulnerabilities on its own: it never sprays passwords, requests certificates,
-coerces authentication, or performs DCSync. It reports the routes and the exact
-operator commands so a human decides what to run. The built-in `--scope`
-control is provided to help confine testing to an authorized target range, but
-scoping is a safety aid and **not** a substitute for proper authorization.
+Domainerator is a **detection and guidance** tool. It enumerates vulnerabilities
+and maps attack paths, presenting commands for each exploitation step. The
+interactive console can guide operators through execution with confirmation
+prompts, but all exploitation actions require explicit operator approval. The
+tool never automatically sprays passwords, coerces authentication, requests
+certificates, or performs DCSync without user confirmation.
+
+The console's `relay` command can orchestrate active exploitation — it starts a
+relay listener and triggers authentication coercion against a victim host — but
+only after the operator reviews the exact commands and explicitly confirms. This
+is loud, intrusive activity: run it only with authorization that covers the
+victim host, and only within your defined `--scope`. Domainerator ships no
+exploit code of its own; `relay` and every other step invoke external tools
+(ntlmrelayx, coercer, certipy, netexec, impacket, etc.) that you install
+yourself.
+
+The built-in `--scope` control is provided to help confine testing to an
+authorized target range, but scoping is a safety aid and **not** a substitute
+for proper authorization.
+
+When `--output-dir` is used, Domainerator writes evidence files and reports that
+can contain sensitive engagement data (recovered credentials, hashes, directory
+information). Passwords passed on the command line are redacted from recorded
+commands, but raw tool output may still contain secrets. Treat the output folder
+as sensitive: store it securely, and handle and dispose of it per your rules of
+engagement.

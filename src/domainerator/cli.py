@@ -27,9 +27,11 @@ from pathlib import Path
 
 from . import __version__, bloodhound
 from . import paths as paths_mod
+from .evidence import EvidenceWriter
+from .progress import KeypressStatus, ProgressTracker
 from .report import Report
 from .runner import CheckResult, Scope, ScopeError, Target, ToolRunner
-from .scan import ScanOptions, scan_targets
+from .scan import ScanOptions, count_units, scan_targets
 from .state import State
 
 logger = logging.getLogger("domainerator")
@@ -77,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Skip authenticated checks.")
     scope.add_argument("--skip-adcs", action="store_true",
                        help="Skip AD CS checks.")
+    scope.add_argument("--skip-sccm", action="store_true",
+                       help="Skip SCCM / PXE NAA checks.")
     scope.add_argument("--userlist",
                        help="User list file for unauthenticated AS-REP roasting.")
 
@@ -111,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Path to a JSON state file. Loaded to seed known "
                           "capabilities and updated with what this run finds "
                           "(supports the iterative foothold->DA workflow).")
+    run.add_argument("--no-status", action="store_true",
+                     help="Disable the interactive 'press Enter for status' "
+                          "feature (auto-disabled when stdin is not a TTY).")
     run.add_argument("--dry-run", action="store_true",
                      help="Show commands without executing them.")
     run.add_argument("-v", "--verbose", action="store_true",
@@ -121,10 +128,20 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Write a Markdown report to this file.")
     outg.add_argument("--json", dest="json_output",
                       help="Write a JSON report to this file.")
+    outg.add_argument("--output-dir",
+                      help="Directory for engagement artifacts. Each run creates a "
+                           "timestamped subfolder with per-check evidence files "
+                           "(command + raw output) suitable for report screenshots, "
+                           "plus any reports written from the console.")
     outg.add_argument("--no-color", action="store_true",
                       help="Disable colored console output.")
     outg.add_argument("--include-raw", action="store_true",
                       help="Include raw tool output in the Markdown report.")
+
+    interactive = parser.add_argument_group("interactive mode")
+    interactive.add_argument("--console", action="store_true",
+                             help="Launch interactive Metasploit-style console after scanning. "
+                                  "Enables path selection, command execution, and privilege tracking.")
 
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
@@ -199,6 +216,53 @@ def discovered_capabilities(results: list[CheckResult]) -> set:
     return caps
 
 
+def launch_console(
+    runner: ToolRunner,
+    targets: list[Target],
+    state: State,
+    state_path: str | None,
+    all_results: list[CheckResult],
+    attack_paths: list,
+    start_caps: set,
+    scope: Scope | None,
+    evidence: EvidenceWriter | None = None,
+) -> int:
+    """Launch the interactive console with accumulated scan results.
+
+    This creates a Session object from the current scan state and enters
+    a Metasploit-style REPL for exploring and executing attack paths.
+    """
+    from .console import Console, Session
+
+    # The first scanned target is the initial active target; the full list is
+    # kept so the operator can switch targets and 'relay' can pick a victim.
+    all_targets = list(targets) if targets else [Target(host="unknown")]
+    primary_target = all_targets[0]
+
+    # Create session with accumulated results.
+    session = Session(
+        runner=runner,
+        target=primary_target,
+        targets=all_targets,
+        state=state,
+        state_path=state_path,
+        evidence=evidence,
+    )
+    session.add_results(all_results)
+    session.capabilities = set(start_caps)
+    session.attack_paths = attack_paths
+
+    # Adjust runner for console mode (disable dry_run if set).
+    runner.dry_run = False
+
+    print("\n" + "=" * 60)
+    print("Entering interactive console mode")
+    print("=" * 60 + "\n")
+
+    console = Console(session)
+    return console.run()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -268,11 +332,23 @@ def main(argv: list[str] | None = None) -> int:
         skip_unauth=args.skip_unauth,
         skip_auth=args.skip_auth,
         skip_adcs=args.skip_adcs,
+        skip_sccm=args.skip_sccm,
         userlist=args.userlist,
     )
 
     logger.info("scanning %d target(s)", len(targets))
-    per_host = scan_targets(runner, targets, opts, max_workers=args.workers)
+
+    # Live status: a keypress on Enter prints progress. Disabled under
+    # --dry-run (nothing meaningfully runs), --no-status, or a non-TTY stdin.
+    tracker = ProgressTracker()
+    tracker.set_total(count_units(targets, opts))
+    status_enabled = not args.no_status and not args.dry_run
+    with KeypressStatus(tracker, enabled=status_enabled):
+        per_host = scan_targets(
+            runner, targets, opts, max_workers=args.workers, tracker=tracker
+        )
+    if status_enabled and sys.stdin.isatty():
+        print(tracker.format_final(), file=sys.stderr)
 
     # BloodHound collection/ingestion is domain-wide -> done once, not per host.
     bh_results: list[CheckResult] = []
@@ -344,6 +420,42 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_output:
         Path(args.json_output).write_text(report.to_json(), encoding="utf-8")
         print(f"JSON report written to {args.json_output}")
+
+    # Evidence capture: per-check command + raw output files for screenshots.
+    evidence: EvidenceWriter | None = None
+    if args.output_dir:
+        evidence = EvidenceWriter(args.output_dir)
+        # Attribute each result to its host where we can (per-host results were
+        # aggregated into all_results; use the single target label otherwise).
+        host_label = target_hosts[0] if len(target_hosts) == 1 else ""
+        try:
+            written = evidence.write_results(all_results, target=host_label)
+            # Also drop the reports into the run folder for a single bundle.
+            evidence.write_text(
+                "report.md", report.to_markdown(include_raw=args.include_raw)
+            )
+            evidence.write_text("report.json", report.to_json())
+            print(
+                f"\nEvidence for {len(written)} check(s) written to "
+                f"{evidence.run_dir}"
+            )
+        except OSError as exc:
+            logger.warning("could not write evidence: %s", exc)
+            evidence = None
+
+    # Launch interactive console if requested.
+    if args.console:
+        return launch_console(
+            runner=runner,
+            evidence=evidence,
+            targets=targets,
+            state=state,
+            state_path=args.state,
+            all_results=all_results,
+            attack_paths=attack_paths,
+            start_caps=start_caps,
+            scope=scope,
+        )
 
     # Exit code: 1 if a complete escalation path was found or any MEDIUM+
     # finding exists (useful for gating in automation), else 0.

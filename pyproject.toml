@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "domainerator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Attack-path mapping for Windows Active Directory: correlate NetExec/Certipy/Impacket findings and BloodHound-CE ACL edges into ranked routes to Domain/Enterprise Admin"
 readme = "README.md"
 license = { text = "MIT" }

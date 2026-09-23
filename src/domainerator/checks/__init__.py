@@ -45,6 +45,12 @@ _FAILURE_SIGNALS = (
     "status_access_denied",
     "error",
     "traceback",
+    # NetExec prints "[-]" for a negative/failed result and "[+]"/"[*]" for a
+    # positive one. A "[-]" line means the module did not succeed, so a check
+    # that parsed no finding cannot be called clean. Listing it here also stops
+    # a negative line that happens to mention a keyword (e.g. "[-] no sccm")
+    # from defeating the per-check "no recognizable output" guard.
+    "[-]",
 )
 
 

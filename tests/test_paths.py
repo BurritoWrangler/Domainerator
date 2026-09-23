@@ -158,3 +158,45 @@ def test_attackpath_score_and_summary():
     d = path.to_dict()
     assert d["goal"] == "dcsync"
     assert d["steps"][0]["technique"] == "A"
+
+
+def test_ntlmv1_chain_yields_crackable_hash():
+    # NTLMV1_HOST + coercion (baseline) -> crackable hash.
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("ntlmv1", "NTLMv1",
+                       {Capability.UNAUTHENTICATED}, Capability.NTLMV1_HOST))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.CRACKABLE_HASH],
+        max_depth=10,
+    )
+    assert got, "NTLMv1 + coercion -> crackable hash chain did not resolve"
+
+
+def test_ntlm_reflection_chain_reaches_local_admin():
+    # SELF_RELAY_TARGET + coercion (baseline) -> local admin.
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("refl", "NTLM-Reflection-target",
+                       {Capability.UNAUTHENTICATED}, Capability.SELF_RELAY_TARGET))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.LOCAL_ADMIN],
+        max_depth=10,
+    )
+    assert got, "NTLM reflection + coercion -> local admin chain did not resolve"
+
+
+def test_sccm_naa_chain_grants_credentials():
+    # SCCM NAA creds -> valid credentials (baseline glue), reachable unauth.
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("naa", "SCCM-PXE-NAA",
+                       {Capability.UNAUTHENTICATED}, Capability.SCCM_NAA_CREDS))
+    got = eng.find_paths(
+        {Capability.UNAUTHENTICATED},
+        goals=[Capability.VALID_CREDENTIALS],
+        max_depth=10,
+    )
+    assert got, "SCCM NAA -> valid credentials chain did not resolve"

@@ -608,6 +608,167 @@ def check_nopac(runner: ToolRunner, target: Target, timeout: int = 180) -> Check
     return result
 
 
+def check_gpp_cpassword(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Search SYSVOL Group Policy Preferences for cpassword secrets.
+
+    GPP XML files (Groups.xml, Services.xml, ScheduledTasks.xml, etc.) can carry
+    a ``cpassword`` attribute encrypted with a *public, Microsoft-published* AES
+    key, so any authenticated user who can read SYSVOL can trivially decrypt it.
+    The recovered credentials are valid domain credentials, frequently for a
+    privileged local/service account.
+    """
+    name = "GPP cpassword in SYSVOL"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    # NetExec's gpp_password module reads SYSVOL and decrypts any cpassword.
+    argv = ["nxc", "smb", target.host, *target.nxc_auth_args(), "-M", "gpp_password"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The module prints recovered "Username: ... Password: ..." pairs. Treat any
+    # recovered credential (or an explicit cpassword hit) as a finding.
+    creds = re.findall(r"[Uu]sername\s*:\s*(\S+).*?[Pp]assword\s*:\s*(\S+)", text, re.DOTALL)
+    if creds or re.search(r"cpassword|Found credentials", text, re.IGNORECASE):
+        users = ", ".join(sorted({u for u, _ in creds}))[:200]
+        result.add_finding(
+            Finding(
+                title="GPP cpassword credentials recovered from SYSVOL",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    "Group Policy Preferences in SYSVOL contained a cpassword "
+                    "value encrypted with the public Microsoft AES key. It was "
+                    "decrypted to plaintext domain credentials, usable "
+                    "immediately for authenticated access."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Remove GPP items containing cpassword from SYSVOL and apply "
+                    "KB2962486. Rotate any exposed account passwords."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Recover GPP cpassword -> credentials",
+                technique="GPP-cpassword",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.VALID_CREDENTIALS,
+                command=f"nxc smb {target.host} -u USER -p PASS -M gpp_password",
+                description=(
+                    "Decrypt a SYSVOL GPP cpassword to recover valid (often "
+                    "privileged) domain credentials."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=users,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"GPP search inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"gpp|sysvol|cpassword|no.*password", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "gpp_password module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_pre2k_computers(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Find pre-Windows 2000 computer accounts with predictable passwords.
+
+    A computer object created with the "assign as a pre-Windows 2000 computer"
+    option (or left unprovisioned) has its password set to the lowercase of the
+    account name without the trailing ``$``. Any such account is a free
+    authenticated foothold.
+    """
+    name = "Pre-Windows 2000 computer accounts"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    # NetExec's pre2k module (ldap) flags computer accounts whose password
+    # matches the pre-2000 default.
+    argv = ["nxc", "ldap", target.host, *target.nxc_auth_args(), "-M", "pre2k"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The module reports each vulnerable computer account it authenticates as.
+    accounts = re.findall(r"([A-Za-z0-9._-]+\$)", text)
+    if accounts or re.search(r"pre2k|pre-?2000|VULNERABLE", text, re.IGNORECASE):
+        names = ", ".join(sorted(set(accounts)))[:200]
+        result.add_finding(
+            Finding(
+                title="Pre-Windows 2000 computer account(s) with default password",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    "One or more computer accounts have a password matching the "
+                    "predictable pre-Windows 2000 default (lowercase account "
+                    "name). These authenticate as a machine account and provide "
+                    "an immediate domain foothold."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Reset or re-provision affected computer accounts; avoid the "
+                    "'pre-Windows 2000' compatibility option when creating them."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Authenticate as pre-2000 computer -> credentials",
+                technique="Pre2k",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.VALID_CREDENTIALS,
+                command=f"nxc ldap {target.host} -u USER -p PASS -M pre2k",
+                description=(
+                    "Authenticate with the predictable pre-2000 machine-account "
+                    "password to obtain a domain foothold."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=names,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"pre2k check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"pre2k|pre-?2000|computer|no.*account", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "pre2k module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
 def _mark_inconclusive_on_failure(results: list[CheckResult]) -> list[CheckResult]:
     """Post-process: a ran-but-empty check whose output shows a connection or
     auth failure is inconclusive, not clean.
@@ -639,5 +800,7 @@ def run_all(runner: ToolRunner, target: Target, timeout: int = 300) -> list[Chec
         check_rbcd(runner, target, timeout=min(timeout, 240)),
         check_coercion(runner, target, timeout=min(timeout, 180)),
         check_nopac(runner, target, timeout=min(timeout, 180)),
+        check_gpp_cpassword(runner, target, timeout=min(timeout, 180)),
+        check_pre2k_computers(runner, target, timeout=min(timeout, 180)),
     ]
     return _mark_inconclusive_on_failure(results)

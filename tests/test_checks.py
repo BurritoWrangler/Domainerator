@@ -131,3 +131,109 @@ def test_auth_failure_marked_inconclusive_by_run_all_postprocess():
     authenticated._mark_inconclusive_on_failure([clean, failed])
     assert not clean.inconclusive
     assert failed.inconclusive
+
+
+def test_ntlmv1_detected_and_emits_step():
+    output = "SMB  10.0.0.10  NTLMV1  NTLMv1 allowed (LmCompatibilityLevel: 2)"
+    res = unauthenticated.check_ntlmv1(FakeRunner(output), ANON_TARGET)
+    assert any("NTLMv1" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NTLMV1_HOST in grants
+    assert not res.inconclusive
+
+
+def test_ntlmv1_inconclusive_on_unrecognized_output():
+    res = unauthenticated.check_ntlmv1(FakeRunner("SMB 10.0.0.10  [-] something else"), ANON_TARGET)
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_ntlm_reflection_detected_and_emits_step():
+    output = "SMB  10.0.0.10  NTLM_REFLECTION  Host is VULNERABLE to NTLM reflection"
+    res = unauthenticated.check_ntlm_reflection(FakeRunner(output), ANON_TARGET)
+    assert any("reflection" in f.title.lower() for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.SELF_RELAY_TARGET in grants
+
+
+def test_ntlm_reflection_inconclusive_on_unrecognized_output():
+    res = unauthenticated.check_ntlm_reflection(
+        FakeRunner("SMB 10.0.0.10  [-] unrelated line"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+# --- GPP cpassword, pre-2000 computers, timeroasting -----------------------
+
+def test_gpp_cpassword_recovers_credentials_and_emits_step():
+    output = "[+] Found credentials Username: svc_backup Password: Sup3rS3cret!"
+    res = authenticated.check_gpp_cpassword(FakeRunner(output), AUTH_TARGET)
+    assert any("GPP cpassword" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.VALID_CREDENTIALS in grants
+
+
+def test_gpp_cpassword_skips_without_creds():
+    res = authenticated.check_gpp_cpassword(FakeRunner(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_gpp_cpassword_inconclusive_on_unrecognized():
+    res = authenticated.check_gpp_cpassword(FakeRunner("SMB 10.0.0.10 [-] blah"), AUTH_TARGET)
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_pre2k_detects_vulnerable_computer_and_emits_step():
+    output = "LDAP  10.0.0.10  PRE2K  WS01$ is VULNERABLE (pre2k default password)"
+    res = authenticated.check_pre2k_computers(FakeRunner(output), AUTH_TARGET)
+    assert any("Pre-Windows 2000" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.VALID_CREDENTIALS in grants
+
+
+def test_pre2k_inconclusive_on_unrecognized():
+    res = authenticated.check_pre2k_computers(FakeRunner("LDAP 10.0.0.10 [-] none"), AUTH_TARGET)
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_timeroast_recovers_hashes_and_emits_crack_chain():
+    # Timeroasting needs no credentials, so it lives in the unauthenticated
+    # module and works against an anonymous target.
+    output = "1000:$sntp-ms$abcdef0123456789$deadbeef"
+    res = unauthenticated.check_timeroast(FakeRunner(output), ANON_TARGET)
+    assert any("Timeroast" in f.title for f in res.findings)
+    techniques = {s.technique for s in res.path_steps}
+    # Emits the roast step and the follow-on crack step.
+    assert "Timeroast" in techniques
+    assert "Hash-crack" in techniques
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.CRACKABLE_HASH in grants
+    assert Capability.VALID_CREDENTIALS in grants
+
+
+def test_timeroast_works_authenticated_too():
+    # With creds present it uses them but still functions the same.
+    output = "$sntp-ms$abcdef0123456789$deadbeef"
+    res = unauthenticated.check_timeroast(FakeRunner(output), AUTH_TARGET)
+    assert any("Timeroast" in f.title for f in res.findings)
+
+
+def test_timeroast_inconclusive_on_unrecognized():
+    res = unauthenticated.check_timeroast(FakeRunner("SMB 10.0.0.10 [-] nope"), ANON_TARGET)
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_new_checks_registered_in_run_all():
+    # GPP and pre-2000 are credentialed -> authenticated module.
+    auth_results = authenticated.run_all(FakeRunner("nothing recognizable"), AUTH_TARGET, timeout=60)
+    auth_names = {r.name for r in auth_results}
+    assert "GPP cpassword in SYSVOL" in auth_names
+    assert "Pre-Windows 2000 computer accounts" in auth_names
+    # Timeroasting is credential-free -> unauthenticated (shared) phase.
+    unauth_results = unauthenticated.run_all(FakeRunner("nothing"), ANON_TARGET, timeout=60)
+    unauth_names = {r.name for r in unauth_results}
+    assert "Timeroasting (NTP computer-account hashes)" in unauth_names
