@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import logging
 import sys
 from pathlib import Path
@@ -55,10 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     tgt = parser.add_argument_group("target")
     tgt.add_argument("-t", "--target",
-                     help="Target host/IP (typically a domain controller).")
+                     help="Target host/IP, or a CIDR subnet (e.g. 10.0.0.0/24) "
+                          "which is expanded to its usable hosts.")
     tgt.add_argument("-T", "--targets",
-                     help="File of targets (one IP/host per line) to scan "
-                          "concurrently. Mutually complementary with --target.")
+                     help="File of targets (one IP/host/CIDR per line) to scan "
+                          "concurrently. CIDR entries are expanded. Mutually "
+                          "complementary with --target.")
     tgt.add_argument("-d", "--domain", help="Active Directory domain (FQDN).")
     tgt.add_argument("--dc-ip", help="Domain controller IP (for Kerberos/AD CS).")
 
@@ -182,17 +185,64 @@ def build_tool_inventory(runner: ToolRunner) -> dict[str, str | None]:
     return inventory
 
 
+# Upper bound on how many hosts a single CIDR may expand to. A fat-fingered
+# prefix (e.g. /8) would otherwise try to build millions of Targets; we refuse
+# and tell the operator to narrow the range or use a targets file.
+MAX_CIDR_HOSTS = 4096
+
+
+def expand_target(entry: str) -> list[str]:
+    """Expand a single target entry into concrete host strings.
+
+    A CIDR (``10.0.0.0/24``) expands to its usable host addresses; a plain IP
+    or hostname passes through unchanged. Raises ``ValueError`` if a CIDR would
+    expand beyond :data:`MAX_CIDR_HOSTS`.
+    """
+    if "/" not in entry:
+        return [entry]
+    # Looks like CIDR - parse it. strict=False tolerates host bits being set
+    # (e.g. 10.0.0.5/24), interpreting it as the containing network.
+    try:
+        net = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        # Not a valid network (e.g. a path or an odd hostname with a slash);
+        # treat it as an opaque host string and let downstream tools decide.
+        return [entry]
+
+    # A single-address network (/32, /128) is just that host.
+    if net.num_addresses == 1:
+        return [str(net.network_address)]
+
+    hosts = list(net.hosts())  # excludes network/broadcast for IPv4
+    if len(hosts) > MAX_CIDR_HOSTS:
+        raise ValueError(
+            f"'{entry}' expands to {len(hosts)} hosts (limit {MAX_CIDR_HOSTS}); "
+            "narrow the prefix or list hosts in a --targets file"
+        )
+    return [str(h) for h in hosts]
+
+
 def load_targets(args: argparse.Namespace) -> list[str]:
-    """Collect target hosts from --target and/or --targets file."""
-    hosts: list[str] = []
+    """Collect target hosts from --target and/or --targets file.
+
+    Entries may be single IPs/hostnames or CIDR subnets; subnets are expanded
+    to their usable host addresses. ``--target`` and each non-comment line of a
+    ``--targets`` file are processed the same way.
+    """
+    raw_entries: list[str] = []
     if args.target:
-        hosts.append(args.target)
+        raw_entries.append(args.target)
     if args.targets:
         text = Path(args.targets).read_text(encoding="utf-8")
         for raw in text.splitlines():
             entry = raw.strip()
             if entry and not entry.startswith("#"):
-                hosts.append(entry)
+                raw_entries.append(entry)
+
+    hosts: list[str] = []
+    for entry in raw_entries:
+        hosts.extend(expand_target(entry))
+
     # De-duplicate, preserve order.
     seen: set[str] = set()
     ordered: list[str] = []
@@ -271,8 +321,15 @@ def main(argv: list[str] | None = None) -> int:
         format="[%(levelname)s] %(message)s",
     )
 
-    # Determine targets from --target and/or --targets.
-    target_hosts = load_targets(args)
+    # Determine targets from --target and/or --targets (CIDRs are expanded).
+    try:
+        target_hosts = load_targets(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: could not read targets file: {exc}", file=sys.stderr)
+        return 2
     if not target_hosts:
         print("error: provide --target and/or --targets", file=sys.stderr)
         return 2

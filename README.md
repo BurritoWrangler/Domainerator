@@ -513,20 +513,29 @@ target / DC IP are validated up front so an out-of-scope target aborts immediate
 exit code 2. This makes it safe to point Domainerator at a DC while guaranteeing it never
 reaches beyond the agreed range.
 
-### Multiple targets & concurrency
+### Multiple targets, subnets & concurrency
 
-Scan a host list concurrently (respecting `--scope`), correlating findings from all
-hosts plus domain-wide BloodHound data into one path analysis:
+Both `--target` and `--targets` accept **CIDR subnets**, which are expanded to their usable
+host addresses (IPv4 and IPv6). Scan a whole subnet concurrently, correlating findings from
+all hosts plus domain-wide BloodHound data into one path analysis:
 
 ```bash
+# a subnet directly on --target
+domainerator -t 10.0.0.0/24 -d corp.local -u alice -p 'S3cret!' \
+  --workers 8 --scope engagement.scope -o report.md
+
+# or a mix of IPs, hostnames, and CIDRs in a file
 domainerator -T hosts.txt -d corp.local -u alice -p 'S3cret!' \
   --workers 8 --scope engagement.scope -o report.md
 ```
 
-`hosts.txt` is one IP/host per line (`#` comments allowed). `--target` and `--targets`
-can be combined. If any target (or `--dc-ip`) is outside `--scope`, the run aborts before
-touching anything. In `--console` mode, every scanned host is kept in the session so you can
-switch the active target with `target <id>` and pick relay victims from them (see
+`hosts.txt` is one IP/host/CIDR per line (`#` comments allowed). Entries are expanded and
+de-duplicated, so an IP that also falls inside a listed subnet is only scanned once.
+`--target` and `--targets` can be combined. A single CIDR that would expand beyond 4096
+hosts is refused (narrow the prefix or list hosts explicitly) so a fat-fingered `/8` can't
+blow up the run. If any expanded target (or `--dc-ip`) is outside `--scope`, the run aborts
+before touching anything. In `--console` mode, every scanned host is kept in the session so
+you can switch the active target with `target <id>` and pick relay victims from them (see
 [Multi-target sessions](#multi-target-sessions)).
 
 ### Trustworthy results: inconclusive state & tool inventory
@@ -576,8 +585,8 @@ domainerator -t 10.0.0.10 -d corp.local -u alice -p 'S3cret!' --state engagement
 
 | Option | Description |
 | --- | --- |
-| `-t, --target` | Target host/IP, usually a DC |
-| `-T, --targets` | File of targets (one per line) to scan concurrently |
+| `-t, --target` | Target host/IP, or a CIDR subnet (e.g. `10.0.0.0/24`) expanded to its hosts |
+| `-T, --targets` | File of targets (one IP/host/CIDR per line) to scan concurrently |
 | `-d, --domain` | AD domain (FQDN) |
 | `--dc-ip` | Domain controller IP (Kerberos/AD CS) |
 | `-u, --username` | Domain username (enables authenticated checks) |
