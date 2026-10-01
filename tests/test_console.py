@@ -210,3 +210,81 @@ def test_set_then_switch_keeps_value_but_auto_var_updates():
     # Pinned USER preserved; DC updated to t3.
     assert s.variables.get("USER") == "svc_account"
     assert s.variables.get("DC") == "10.0.0.30"
+
+
+# --- console scan / rescan (regression: these were no-op stubs) ------------
+
+from domainerator.console.console import Console  # noqa: E402
+from domainerator.runner import CommandOutput  # noqa: E402
+
+
+class _ScanFakeRunner:
+    """A ToolRunner stand-in that returns canned output per command so the real
+    check parsers produce findings and path steps."""
+
+    def __init__(self, responder):
+        self.timeout = 300
+        self.dry_run = False
+        self.scope = None
+        self._responder = responder
+
+    def is_available(self, name):
+        return True
+
+    def find_tool(self, name):
+        return "/usr/bin/" + name
+
+    def run(self, argv, timeout=None):
+        cmd = " ".join(argv)
+        return CommandOutput(
+            command=cmd, return_code=0,
+            stdout=self._responder(argv, cmd), stderr="", duration_seconds=0.1,
+        )
+
+
+def test_scan_command_runs_checks_and_recomputes(monkeypatch):
+    # SMB-signing-disabled output -> a relay_target capability + a path step.
+    def responder(argv, cmd):
+        if argv[:2] == ["nxc", "smb"] and "-M" not in cmd and "--shares" not in cmd \
+                and "--rid-brute" not in cmd:
+            return "SMB 10.0.0.10 445 DC01 (signing:False) (SMBv1:False)"
+        return ""
+
+    runner = _ScanFakeRunner(responder)
+    target = Target(host="10.0.0.10", domain="corp.local")  # unauthenticated
+    session = Session(runner=runner, target=target, targets=[target])
+    session.capabilities = {Capability.UNAUTHENTICATED}
+    console = Console(session)
+
+    assert session.check_results == []
+    console.cmd_scan(["unauthenticated"])
+
+    # The stub did nothing before; now it must actually run checks and update
+    # the session capabilities from the discovered path steps.
+    assert session.check_results, "scan must populate check results"
+    assert Capability.RELAY_TARGET in session.capabilities
+
+
+def test_rescan_does_not_duplicate_results(monkeypatch):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    target = Target(host="10.0.0.10", domain="corp.local")
+    session = Session(runner=runner, target=target, targets=[target])
+    console = Console(session)
+
+    console.cmd_rescan([])
+    first = len(session.check_results)
+    assert first > 0
+    console.cmd_rescan([])
+    # Re-running replaces prior same-named results rather than appending.
+    assert len(session.check_results) == first
+
+
+def test_scan_rejects_unknown_category(capsys):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    target = Target(host="10.0.0.10", domain="corp.local")
+    session = Session(runner=runner, target=target, targets=[target])
+    console = Console(session)
+    console.cmd_scan(["bogus"])
+    out = capsys.readouterr().out
+    assert "Unknown category" in out
+    assert session.check_results == []

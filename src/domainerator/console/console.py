@@ -940,23 +940,107 @@ class Console:
             print(f"  [{i}] {shown}")
         print()
 
+    # Check categories that can be run from the console.
+    _SCAN_CATEGORIES = ("unauthenticated", "authenticated", "adcs", "sccm")
+
     def cmd_scan(self, args: list[str]) -> None:
-        """Run checks."""
-        print()
+        """Run checks against the active target.
+
+        Usage:
+          scan              Run all applicable checks (same as rescan)
+          scan <category>   Run one category: unauthenticated | authenticated
+                            | adcs | sccm
+
+        Results are merged into the session (new capabilities unioned in) and
+        the attack paths are recomputed, so paths that depend on freshly
+        discovered capabilities (e.g. ESC8 needing a relay target + coercion)
+        appear without leaving the console.
+        """
+        category = None
         if args:
-            print(f"Running specific check: {args[0]}")
-            print("(Specific check execution not yet implemented)")
-            print("Use 'rescan' to run all checks.")
-        else:
-            print("Running all checks...")
-            print("(Use 'rescan' to re-run all checks)")
+            category = args[0].lower()
+            if category not in self._SCAN_CATEGORIES:
+                print(f"Unknown category: {category}")
+                print("Categories: " + ", ".join(self._SCAN_CATEGORIES))
+                return
+        self._run_scan(category)
 
     def cmd_rescan(self, args: list[str]) -> None:
-        """Re-run all checks."""
+        """Re-run all applicable checks against the active target."""
+        self._run_scan(None)
+
+    def _run_scan(self, category: str | None) -> None:
+        """Execute checks against the active target, merge, and recompute paths.
+
+        ``category`` selects a single check module; None runs all applicable
+        ones (gated by whether the target is authenticated, exactly as the CLI
+        does). Prior results for the same checks are replaced so re-running does
+        not pile up duplicates.
+        """
+        from ..scan import ScanOptions, scan_target
+
+        target = self.session.target
         print()
-        print("Re-running all checks...")
-        print("(Full rescan not yet implemented in console mode)")
-        print("For now, exit and re-run domainerator with updated credentials.")
+        label = category or "all applicable"
+        print(f"Running {label} checks against {target.host}...")
+        if self.session.runner.scope is not None and self.session.runner.scope.active:
+            # The runner enforces scope per-command, but warn early if the
+            # active target itself is out of scope so the operator isn't
+            # surprised by a wall of 'refused' results.
+            if not self.session.runner.scope.contains(target.host):
+                print(f"WARNING: {target.host} is outside the configured scope; "
+                      "checks targeting it will be refused.")
+
+        opts = ScanOptions(
+            timeout=self.session.runner.timeout,
+            skip_unauth=category not in (None, "unauthenticated"),
+            skip_auth=category not in (None, "authenticated"),
+            skip_adcs=category not in (None, "adcs"),
+            skip_sccm=category not in (None, "sccm"),
+        )
+
+        try:
+            results = scan_target(self.session.runner, target, opts)
+        except Exception as exc:  # never let a scan crash the console
+            print(f"Scan error: {exc}")
+            return
+
+        if not results:
+            print("No checks ran (the selected category may not apply to this "
+                  "target's auth state).")
+            return
+
+        # Merge: drop prior results for the same (name, category) on this host,
+        # then add the fresh ones so capabilities reflect current reality.
+        fresh_keys = {(r.name, r.category) for r in results}
+        self.session.check_results = [
+            r for r in self.session.check_results
+            if (r.name, r.category) not in fresh_keys
+        ]
+        self.session.add_results(results)
+        self.session.recompute_paths()
+
+        # Summarize what happened.
+        findings = sum(len(r.findings) for r in results)
+        new_steps = sum(len(r.path_steps or []) for r in results)
+        print(f"Ran {len(results)} check(s): {findings} finding(s), "
+              f"{new_steps} path step(s).")
+        print(f"Capabilities: {len(self.session.capabilities)}  "
+              f"Attack paths: {len(self.session.attack_paths)}")
+        if self.session.attack_paths:
+            print("Use 'show paths' to view them.")
+        else:
+            print("No complete escalation path yet. 'show findings' and "
+                  "'show capabilities' show what was discovered; some paths "
+                  "need extra capabilities (e.g. ESC8 needs a relay target + "
+                  "coercion) before they close.")
+
+        # Capture evidence for the re-run checks if an output folder is set.
+        if self.session.evidence is not None:
+            try:
+                self.session.evidence.write_results(results, target=target.host)
+            except OSError as exc:
+                print(f"(could not write evidence: {exc})")
 
     def cmd_save(self, args: list[str]) -> None:
         """Save session state."""
