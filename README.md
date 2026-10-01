@@ -263,6 +263,7 @@ Proceed? [y/N]: y
 | `ldap-rbcd` | Relay to LDAP(S) on the DC, configure RBCD for a controlled account | `rbcd` |
 | `ldap-shadow` | Relay to LDAP(S), add shadow credentials (msDS-KeyCredentialLink) | `reset_password` |
 | `reflection` | Reflect coerced auth back to the originating host over SMB (self-relay) | `local_admin` |
+| `adcs-esc8` | Relay coerced DC auth to the AD CS web-enrollment endpoint for a DC certificate | `cert_as_da` |
 
 **Coercion methods**: `coercer` (multi-method sweep), `petitpotam` (MS-EFSR),
 `printerbug` (MS-RPRN), `dfscoerce` (MS-DFSNM).
@@ -275,6 +276,13 @@ come from the active target's variables, `target <id>` is the quick way to line 
 against a different host. For `reflection` the relay target defaults to the victim itself.
 Passwords are masked in the displayed commands, and the whole action is refused if the
 listener or victim would fall outside `--scope`.
+
+For `adcs-esc8`, set `CA` to the Certificate Authority host (`set CA ca01.corp.local`, or a
+full `http(s)://.../certsrv/certfnsh.asp` URL); the relay target becomes the CA's web-
+enrollment endpoint and the victim defaults to the DC (whose machine-account auth is relayed
+to obtain a `DomainController` certificate). On success it grants `cert_as_da`, which the
+`PKINIT-auth` step then turns into `dcsync` → Domain Admin — so `relay adcs-esc8 petitpotam`
+drives the whole ESC8 chain as one coordinated action instead of juggling terminals.
 
 As with everything in Domainerator, **no exploit code ships in the tool** — `relay` only
 coordinates `ntlmrelayx.py` and the coercion tool you already have installed. If either is

