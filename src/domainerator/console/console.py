@@ -111,10 +111,11 @@ class Console:
                     self.completions = [
                         c.value for c in CoercionMethod if c.value.startswith(text)
                     ]
-                elif parts[0] == "use" and text.isdigit():
-                    # Complete with path IDs
+                elif parts[0] == "use":
+                    # Complete with 1-based path IDs (match 'show paths').
                     self.completions = [
-                        str(i) for i in range(len(self.session.attack_paths))
+                        str(i) for i in range(1, len(self.session.attack_paths) + 1)
+                        if str(i).startswith(text)
                     ]
                 elif parts[0] == "target":
                     self.completions = [
@@ -278,7 +279,9 @@ class Console:
         print(f"{'ID':<4} {'Goal':<20} {'Steps':<6} {'Reliability':<12} {'Noise':<8}")
         print("-" * 60)
 
-        for i, path in enumerate(self.session.attack_paths):
+        # Paths are numbered from 1 to match the scan summary and report
+        # (which list [1], [2], ...). 'use <id>' takes these same 1-based ids.
+        for i, path in enumerate(self.session.attack_paths, 1):
             marker = "*" if path == self.session.selected_path else " "
             print(
                 f"{marker}{i:<3} {path.goal.value:<20} {path.length:<6} "
@@ -288,8 +291,10 @@ class Console:
 
         print()
         print(f"Total: {len(self.session.attack_paths)} paths")
+        print("Select one with 'use <id>' (e.g. 'use 1').")
         if self.session.selected_path:
-            print(f"Selected: path {self.session.attack_paths.index(self.session.selected_path)}")
+            idx = self.session.attack_paths.index(self.session.selected_path) + 1
+            print(f"Selected: path {idx}")
 
     def _show_findings(self) -> None:
         """Display all findings from checks."""
@@ -342,28 +347,72 @@ class Console:
         print()
 
     def cmd_use(self, args: list[str]) -> None:
-        """Select an attack path."""
+        """Select an attack path by its 1-based id (as shown by 'show paths')."""
         if not args:
-            print("Usage: use <path-id>")
-            print("Use 'show paths' to see available paths.")
+            print("Usage: use <path-id>   (the number shown by 'show paths', e.g. 'use 1')")
+            return
+
+        if not self.session.attack_paths:
+            print("No attack paths available yet. Run 'rescan' (or 'scan') first, "
+                  "then 'show paths'.")
             return
 
         try:
             path_id = int(args[0])
         except ValueError:
-            print(f"Invalid path ID: {args[0]}")
+            print(f"Invalid path id: '{args[0]}'. Use a number from 'show paths' "
+                  "(e.g. 'use 1').")
             return
 
-        if self.session.select_path(path_id):
-            path = self.session.selected_path
-            assert path is not None
-            print(f"Selected path {path_id}: {path.summary()}")
-            print(f"Goal: {path.goal.value}")
-            print(f"Steps: {path.length}")
-            self.prompt = self.PROMPT_PATH
-            self._show_step_info()
+        count = len(self.session.attack_paths)
+        if not self.session.select_path(path_id):
+            print(f"Invalid path id: {path_id}. Valid ids are 1-{count} "
+                  "(see 'show paths').")
+            return
+
+        path = self.session.selected_path
+        if path is None:  # defensive: should not happen after a True select
+            print("Internal error: path selection failed; please re-run 'show paths'.")
+            return
+
+        print(f"Selected path {path_id}: {path.summary()}")
+        print(f"Goal: {path.goal.value}")
+        print(f"Steps: {path.length}")
+        # Surface how far this path is actually achievable from where you are,
+        # so following it leads to the intended privilege escalation.
+        self._report_path_readiness(path)
+        self.prompt = self.PROMPT_PATH
+        self._show_step_info()
+
+    def _report_path_readiness(self, path) -> None:
+        """Tell the operator which steps are already satisfiable and flag any
+        step whose prerequisites aren't met yet, so 'following the path' maps to
+        a real escalation rather than a dead end.
+
+        Walks the chain accumulating granted capabilities on top of what the
+        session already holds; the first step whose ``requires`` is not covered
+        is reported as the point that needs an extra capability (e.g. ESC8
+        needing a relay target + coercion).
+        """
+        held = set(self.session.capabilities)
+        blocked_at = None
+        blocking_caps: set = set()
+        for i, step in enumerate(path.steps, 1):
+            unmet = {c for c in step.requires if c not in held}
+            if unmet and blocked_at is None:
+                blocked_at = i
+                blocking_caps = unmet
+            held.add(step.grants)
+        if blocked_at is None:
+            print(f"Reachability: all {path.length} step(s) are satisfiable from "
+                  "your current capabilities -> goal is achievable.")
         else:
-            print(f"Invalid path ID: {path_id}. Use 'show paths' to see available paths.")
+            missing = ", ".join(sorted(c.value for c in blocking_caps))
+            print(f"Reachability: steps 1-{blocked_at - 1} are satisfiable; step "
+                  f"{blocked_at} needs capability: {missing}.")
+            print("  You can still walk the path, but that step won't complete "
+                  "until you gain the missing capability (run it, use 'grant', or "
+                  "run the prerequisite path first).")
 
     def cmd_info(self, args: list[str]) -> None:
         """Show details of selected path."""

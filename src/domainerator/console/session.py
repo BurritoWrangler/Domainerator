@@ -138,9 +138,15 @@ class Session:
         return self.current_step()
 
     def select_path(self, path_id: int) -> bool:
-        """Select an attack path by index (0-based). Returns False if invalid."""
-        if 0 <= path_id < len(self.attack_paths):
-            self.selected_path = self.attack_paths[path_id]
+        """Select an attack path by its 1-based id. Returns False if invalid.
+
+        The id matches what 'show paths', the scan summary, and the report all
+        display ([1], [2], ...). Internally paths are a 0-based list, so we
+        subtract one here; this is the single place that conversion happens.
+        """
+        index = path_id - 1
+        if 0 <= index < len(self.attack_paths):
+            self.selected_path = self.attack_paths[index]
             self.selected_step_index = 0
             return True
         return False

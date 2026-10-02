@@ -288,3 +288,69 @@ def test_scan_rejects_unknown_category(capsys):
     out = capsys.readouterr().out
     assert "Unknown category" in out
     assert session.check_results == []
+
+
+# --- path selection numbering (regression: show paths vs use were off-by-one)
+
+def _session_with_paths():
+    runner = ToolRunner(dry_run=True)
+    target = Target(host="10.0.0.10", domain="corp.local",
+                    username="alice", password="pw", dc_ip="10.0.0.10")
+    session = Session(runner=runner, target=target, targets=[target])
+    r = CheckResult(name="kerb", category="authenticated")
+    r.add_step(PathStep(
+        name="Kerberoast", technique="Kerberoast",
+        requires=frozenset({Capability.VALID_CREDENTIALS}),
+        grants=Capability.SPN_TGS, command="nxc ldap DC --kerberoasting",
+        description="d", reliability=Reliability.HIGH, noise=Noise.QUIET,
+    ))
+    session.add_results([r])
+    session.capabilities = {
+        Capability.UNAUTHENTICATED, Capability.VALID_CREDENTIALS,
+        Capability.LOW_PRIV_USER, Capability.DCSYNC,
+    }
+    session.recompute_paths()
+    return session
+
+
+def test_select_path_is_one_based():
+    s = _session_with_paths()
+    assert s.attack_paths, "fixture must produce at least one path"
+    # id 1 selects the first path; id 0 is now invalid.
+    assert s.select_path(1) is True
+    assert s.selected_path is s.attack_paths[0]
+    assert s.select_path(0) is False
+
+
+def test_select_path_last_id_valid_and_overflow_rejected():
+    s = _session_with_paths()
+    n = len(s.attack_paths)
+    assert s.select_path(n) is True
+    assert s.selected_path is s.attack_paths[n - 1]
+    # One past the end must not select (this was the off-by-one error).
+    assert s.select_path(n + 1) is False
+
+
+def test_cmd_use_rejects_out_of_range_without_crashing(capsys):
+    s = _session_with_paths()
+    console = Console(s)
+    n = len(s.attack_paths)
+    console.cmd_use([str(n + 1)])
+    out = capsys.readouterr().out
+    assert "Invalid path id" in out
+    assert s.selected_path is None
+
+
+def test_cmd_use_non_numeric_is_handled(capsys):
+    s = _session_with_paths()
+    console = Console(s)
+    console.cmd_use(["abc"])
+    assert "Invalid path id" in capsys.readouterr().out
+
+
+def test_cmd_use_reports_reachability(capsys):
+    s = _session_with_paths()
+    console = Console(s)
+    console.cmd_use(["1"])
+    out = capsys.readouterr().out
+    assert "Reachability:" in out
