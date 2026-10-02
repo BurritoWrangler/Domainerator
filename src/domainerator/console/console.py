@@ -56,6 +56,7 @@ class Console:
             "info": self.cmd_info,
             "run": self.cmd_run,
             "exploit": self.cmd_run,
+            "autorun": self.cmd_autorun,
             "preview": self.cmd_preview,
             "next": self.cmd_next,
             "back": self.cmd_back,
@@ -215,7 +216,8 @@ class Console:
         print("  use <id>             Select an attack path by ID")
         print("  info                 Show details of selected path")
         print("  preview              Show the current step's fully-substituted command")
-        print("  run, exploit         Execute/guide through current step")
+        print("  run, exploit         Execute/guide through the current step")
+        print("  autorun              Auto-walk the whole path; pause only when you're needed")
         print("  next                 Advance to next step in path")
         print("  back                 Deselect current path, return to main menu")
         print()
@@ -540,6 +542,168 @@ class Console:
             else:
                 print(f"Invalid choice: {choice}")
 
+    def cmd_autorun(self, args: list[str]) -> None:
+        """Walk the selected path end to end, executing every step it safely can.
+
+        Usage: autorun
+
+        From the current step, autorun executes each auto-runnable step (resolve
+        -> run -> grant capability -> advance) without further prompts, until it
+        reaches the path's goal or hits a step that needs you (offline cracking,
+        a relay/coercion chain, an unset environment variable, or a shell
+        command). At that point it stops and tells you exactly what to do, so
+        you can act and resume with 'autorun'.
+
+        One confirmation is asked up front (the chain is executed for real,
+        scope-enforced). LOUD steps still get an explicit per-step confirm.
+        """
+        path = self.session.selected_path
+        if not path:
+            print("No path selected. Use 'show paths' then 'use <id>' first.")
+            return
+        if self.session.current_step() is None:
+            print("This path is already complete.")
+            return
+
+        # Preflight: prompt once for any environment-specific variable the
+        # remaining steps need, so the run doesn't stall midway to ask.
+        if not self._autorun_preflight(path):
+            print("Autorun cancelled.")
+            return
+
+        # One up-front confirmation for the whole chain.
+        goal = path.goal.value
+        print()
+        print(f"Autorun will execute the path toward '{goal}', step by step,")
+        print("pausing only where a step needs you. Commands run for real and")
+        print("are scope-enforced.")
+        if not self._confirm("Begin autorun? [y/N]: "):
+            print("Autorun cancelled.")
+            return
+
+        self._autorun_loop(path)
+
+    def _autorun_loop(self, path) -> None:
+        """Execute auto-runnable steps in sequence until goal or a human gate."""
+        from .execplan import StepClass, classify_step
+
+        while True:
+            step = self.session.current_step()
+            if step is None:
+                print()
+                print(f"[+] Autorun complete — reached end of path. Goal: "
+                      f"{path.goal.value}.")
+                # Mark the goal capability as held (end-of-path semantics).
+                self.session.grant_capability(path.goal)
+                self.session.recompute_paths()
+                return
+
+            idx = self.session.selected_step_index + 1
+            total = len(path.steps)
+            cls = classify_step(step, self.session.variables)
+
+            print()
+            print(f"--- Step {idx}/{total}: [{step.technique}] {step.name} ---")
+
+            # If we already hold what this step grants, skip ahead.
+            if step.grants in self.session.capabilities:
+                print(f"    Already hold '{step.grants.value}'; skipping.")
+                self.session.next_step()
+                continue
+
+            if cls.kind is StepClass.NEEDS_HUMAN:
+                print(f"[!] Pausing: {cls.reason}")
+                print(f"    Command: {cls.resolved_command}")
+                self._autorun_pause_hint(step, cls)
+                return
+
+            # LOUD steps still get an explicit confirm even under autorun.
+            if step.noise.label == "Loud":
+                print("    This step is LOUD (noisy/disruptive).")
+                if not self._confirm("    Run this step? [y/N]: "):
+                    print("    Stopped at operator request. Resume with 'autorun'.")
+                    return
+
+            print(f"    Running: {cls.resolved_command}")
+            try:
+                argv = shlex.split(cls.resolved_command, comments=True)
+            except ValueError as exc:
+                print(f"[!] Could not parse command: {exc}. Stopping.")
+                return
+
+            ok = self._run_resolved(step, argv, advance=True)
+            if not ok:
+                print("[!] Step did not confirm success; stopping autorun.")
+                print("    Review the output above. If it actually worked, use "
+                      "'grant <capability>' then 'autorun' to continue.")
+                return
+
+    def _autorun_preflight(self, path) -> bool:
+        """Prompt once for environment-specific variables the path still needs.
+
+        Returns False only if the operator aborts at the prompt. Unset values
+        are optional to provide here; any still-missing ones will simply cause
+        autorun to pause at the relevant step.
+        """
+        from .execplan import classify_step
+
+        needed: list[str] = []
+        held = set(self.session.capabilities)
+        for step in path.steps[self.session.selected_step_index:]:
+            if step.grants in held:
+                continue
+            cls = classify_step(step, self.session.variables)
+            if cls.missing_vars:
+                for var in cls.missing_vars:
+                    if var not in needed:
+                        needed.append(var)
+            held.add(step.grants)
+
+        if not needed:
+            return True
+
+        print()
+        print("This path needs a few environment-specific values before it can "
+              "run unattended:")
+        for var in needed:
+            print(f"  - {var}")
+        print("Enter them now (blank to skip; autorun will pause at that step).")
+        for var in needed:
+            try:
+                val = input(f"  set {var} = ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            if val:
+                self.session.variables.set(var, val)
+        return True
+
+    def _autorun_pause_hint(self, step, cls) -> None:
+        """Print a concrete next action for a step autorun can't run itself."""
+        tech = step.technique
+        if cls.missing_vars:
+            print(f"    Do: set {cls.missing_vars[0]} <value>  (then 'autorun')")
+        elif tech in ("Hash-crack", "NTLMv1-crack"):
+            print("    Do: crack the hash offline (hashcat/john), then "
+                  "'grant valid_credentials' and 'autorun'.")
+        elif tech in ("Coercion", "WebClientCoercion") or tech.startswith("RelayToLDAP"):
+            print("    Do: use the 'relay' command (coordinates listener + "
+                  "coercion), then 'autorun'.")
+        elif tech == "Password-spray":
+            print("    Do: run the spray yourself (mind lockout), then "
+                  "'grant valid_credentials' and 'autorun'.")
+        else:
+            print("    Do: run the command manually, then 'grant <capability>' "
+                  "and 'autorun'.")
+
+    def _confirm(self, prompt: str) -> bool:
+        """Prompt for a yes/no confirmation; returns True only on 'y'."""
+        try:
+            return input(prompt).strip().lower() == "y"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
     def _execute_step(self, step, cmd: str, missing: list) -> None:
         """Execute a step's command through the ToolRunner (with confirmation).
 
@@ -616,22 +780,29 @@ class Console:
         print()
         print("Executing...")
         print()
+        self._run_resolved(step, argv, advance=True)
 
+    def _run_resolved(self, step, argv: list[str], *, advance: bool) -> bool:
+        """Execute an already-resolved argv for ``step`` and handle the outcome.
+
+        Shared by interactive ``run`` and ``autorun``. Runs via the ToolRunner
+        (scope + redaction apply), prints output, interprets the outcome, grants
+        the capability + recomputes paths on success, captures evidence, and
+        (when ``advance``) moves to the next step. Returns True on confirmed
+        success, False otherwise.
+        """
         out = self.session.runner.run(argv)
 
         if out.error:
             print(f"Execution error: {out.error}")
-            return
+            self._capture_execution(step.technique, out.command, out.combined, False)
+            return False
 
-        # Show output.
         if out.combined:
             print(out.combined)
             print()
 
-        # Interpret the outcome.
         outcome = outcomes.interpret(step.technique, step.grants, out.combined)
-
-        # Capture evidence for the report (command + raw output) if enabled.
         self._capture_execution(step.technique, out.command, out.combined, outcome.success)
 
         if outcome.loot:
@@ -642,10 +813,13 @@ class Console:
             print(f"[+] Success: granting capability '{outcome.capability.value}'.")
             self.session.grant_capability(outcome.capability)
             self.session.recompute_paths()
-            print("    Attack paths recomputed. Advancing to next step.")
-            self.session.next_step()
-        else:
-            print(f"[!] {outcome.detail}")
+            if advance:
+                print("    Attack paths recomputed. Advancing to next step.")
+                self.session.next_step()
+            return True
+
+        print(f"[!] {outcome.detail}")
+        return False
 
     def _capture_execution(
         self, technique: str, command: str, output: str, success: bool | None

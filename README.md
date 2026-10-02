@@ -101,6 +101,7 @@ The console provides:
 - **Variable substitution** — `set LHOST 10.0.0.5` fills command placeholders (Metasploit-style)
 - **Step-by-step guidance** — `run` or `exploit` walks through each step with command preview
 - **Real execution** — run commands through the built-in runner (scope-enforced, password-redacted)
+- **Seamless autorun** — `autorun` walks a whole path end-to-end, pausing only where a human is genuinely needed
 - **Reactive capability tracking** — successful step output auto-grants the resulting capability and recomputes paths
 - **Relay orchestration** — `relay` coordinates a background `ntlmrelayx` listener with a coercion trigger as one action
 - **Multi-target sessions** — `targets`/`target <id>` switch the active host among everything you scanned
@@ -120,7 +121,8 @@ The console provides:
 | `use <id>` | Select an attack path by ID |
 | `info` | Show details of selected path and current step |
 | `preview` | Show the current step's fully-substituted command without running |
-| `run` / `exploit` | Execute/guide through current step (with confirmation) |
+| `run` / `exploit` | Execute/guide through the current step (with confirmation) |
+| `autorun` | Auto-walk the whole path; pause only where you're needed |
 | `next` | Advance to next step in path |
 | `back` | Deselect current path, return to main menu |
 | `set <NAME> <value>` | Set a variable that fills command placeholders |
@@ -187,6 +189,62 @@ console **grants the resulting capability, recomputes the attack paths, and adva
 next step** — so `show paths` always reflects your current reality. If the signal isn't
 recognised, the step is reported as unconfirmed and you can record progress yourself with
 `grant <capability>` or the `[m]` option.
+
+### Seamless exploitation: `autorun`
+
+Once you've picked a path and decided to go, `autorun` takes over and walks it end to end:
+for each step it resolves the command from your credentials, executes it (scope-enforced),
+parses the result, grants the resulting capability, recomputes paths, and advances — until
+it reaches the path's goal (`domain_admin` / `dcsync` / `enterprise_admin`).
+
+```
+domainerator > use 1
+domainerator (path) > autorun
+```
+
+It asks for input in only two situations, both up front where possible:
+
+- **Preflight** — if the path needs environment-specific values (`CA`/`TEMPLATE` for an AD CS
+  request, `TARGET` for RBCD), it prompts for them once before starting, so it doesn't stall
+  midway. (You can also `set` them beforehand and skip the prompts.)
+- **One confirmation** — a single "begin autorun?" gate, since it executes for real. LOUD
+  steps (coercion, spray) still get an explicit per-step confirm.
+
+`autorun` **pauses and hands you a concrete next action** — rather than guessing or stalling
+— whenever a step genuinely needs a human:
+
+- **offline cracking** (`hashcat`): crack it, then `grant valid_credentials` and `autorun` to resume
+- **relay/coercion chains**: run the `relay` command (listener + coercion), then `autorun`
+- **password spraying**: run it yourself (lockout-aware), then `grant` and `autorun`
+- **unset variables / shell-pipe commands**: it tells you exactly what to `set` or run
+
+Example of a fully-automated AD CS path reaching Domain Admin:
+
+```
+domainerator (path) > autorun
+Begin autorun? [y/N]: y
+--- Step 1/3: [ESC1] request privileged certificate ---
+    Running: certipy req -u alice@corp.local -p ... -ca corp-CA -template VulnTemplate ...
+    [+] Success: granting capability 'cert_as_da'.
+--- Step 2/3: [PKINIT-auth] authenticate with certificate ---
+    Running: certipy auth -pfx administrator.pfx -dc-ip 10.0.0.10
+    [+] Success: granting capability 'dcsync'.
+--- Step 3/3: [DCSync] DCSync -> Domain Admin ---
+    Running: secretsdump.py -just-dc corp.local/alice@dc01.corp.local
+    [+] Success: granting capability 'domain_admin'.
+[+] Autorun complete — reached end of path. Goal: domain_admin.
+```
+
+Everything `autorun` executes is captured to the evidence folder (`--output-dir`) just like
+interactive runs, so the deliverable reflects exactly what happened. It never bypasses scope
+enforcement, credential redaction, or the unresolved-placeholder guard — "seamless" means
+fewer prompts, not fewer safety checks.
+
+> **Honest limit:** `autorun` cannot *guarantee* Domain Admin from any starting point — that
+> depends on the environment and on steps it can't do unattended (a crack only works if your
+> wordlist has the password; a relay needs a coercible target). What it guarantees is that
+> every step it *can* run deterministically is run for you, and it stops with a clear
+> instruction exactly where you're needed, then resumes on the next `autorun`.
 
 ### Multi-target sessions
 
@@ -733,6 +791,7 @@ domainerator/
 │   │   ├── session.py      # runtime state + capability tracking
 │   │   ├── variables.py    # command placeholder substitution
 │   │   ├── outcomes.py     # output-driven success detection + loot
+│   │   ├── execplan.py     # step classifier for seamless autorun
 │   │   └── relay.py        # ntlmrelayx + coercion orchestration
 │   └── checks/             # unauthenticated, authenticated, adcs check modules
 ├── tests/fixtures/         # captured tool outputs for parser regression tests
