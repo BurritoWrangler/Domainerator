@@ -560,10 +560,21 @@ class Console:
             print("Perform it manually, then use 'grant' or choose [m] to record progress.")
             return
 
-        if missing:
+        # Guard: refuse to run a command that still contains any unresolved
+        # placeholder literal (e.g. VULN-TEMPLATE, TARGET$). This is stronger
+        # than the registered-but-unset 'missing' list - it catches every known
+        # token still present after substitution, so we never execute a broken
+        # command that looks like it ran but can't actually escalate.
+        unresolved = self.session.variables.unresolved_placeholders(step.command)
+        if unresolved:
+            vars_needed = sorted({
+                self.session.variables.owner(tok) for tok in unresolved
+            })
             print()
-            print(f"Refusing to run: unfilled variables {', '.join(missing)}.")
-            print("Set them first with 'set <NAME> <value>'.")
+            print("Refusing to run: the command still contains unresolved "
+                  f"placeholder(s): {', '.join(unresolved)}.")
+            print(f"Set the matching variable(s) first: {', '.join(vars_needed)}")
+            print("  e.g. set TEMPLATE VulnTemplate   /   set TARGET DC01$")
             return
 
         # Parse to argv. Reject shell metacharacters we can't safely execute

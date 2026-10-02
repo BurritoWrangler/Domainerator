@@ -42,12 +42,34 @@ PLACEHOLDER_MAP: dict[str, tuple[str, ...]] = {
     "PASS": ("PASS",),
     # AD CS.
     "CA": ("CORP-CA", "CA-NAME", "CA_NAME"),
-    "TEMPLATE": ("TEMPLATE-NAME", "TEMPLATE_NAME"),
+    "TEMPLATE": ("TEMPLATE-NAME", "TEMPLATE_NAME", "VULN-TEMPLATE"),
+    # The victim object a control edge / RBCD targets (computer or principal).
+    # Environment-specific: left unset so the guard forces the operator to set
+    # it before running an RBCD/shadow-cred step.
+    "TARGET": ("TARGET$", "TARGET"),
+    # Cracking wordlist: the templates say 'wordlist.txt'; we resolve that to a
+    # real default path (distinct from the token, so substitution isn't
+    # circular) and let the operator override it.
+    "WORDLIST": ("wordlist.txt",),
     # Spray password.
     "SPRAY_PASSWORD": ("Season2025!",),
     # Relay orchestration: victim host to coerce (no placeholder token; used
     # by the 'relay' command directly, listed here so it shows in `options`).
     "RELAY_VICTIM": (),
+}
+
+# Variables that are not derived from the Target but carry a safe default so a
+# full exploit chain resolves out of the box. These use distinct token names
+# (not the default value itself) so substitution is never circular.
+#
+# Note: literals already present in the command templates that are fine to run
+# as-is - the output filenames (out.tgs, asrep.hash, timeroast.hash,
+# administrator.pfx), the placeholder machine account 'PWN$', and the literal
+# 'wordlist.txt' - are intentionally NOT placeholders; leaving them literal is
+# correct and keeps the unresolved-placeholder guard focused on the
+# environment-specific values (CA, TEMPLATE, TARGET) that genuinely must be set.
+DEFAULT_VALUES: dict[str, str] = {
+    "WORDLIST": "/usr/share/wordlists/rockyou.txt",
 }
 
 # Reverse index: which variable owns a given placeholder token.
@@ -103,6 +125,20 @@ class Variables:
             if name not in self.values or name in self._auto:
                 self.values[name] = value
                 self._auto.add(name)
+        # Apply non-target defaults so a full chain resolves from the creds.
+        self.seed_defaults()
+
+    def seed_defaults(self) -> None:
+        """Fill DEFAULT_VALUES for any variable the operator hasn't set.
+
+        Defaults are marked auto so they never override an explicit ``set`` and
+        are safe to re-apply. This is what makes a Kerberoast->crack or
+        ADCS->PKINIT chain runnable end to end without manual setup.
+        """
+        for name, value in DEFAULT_VALUES.items():
+            if name not in self.values or name in self._auto:
+                self.values[name] = value
+                self._auto.add(name)
 
     def substitute(self, command: str) -> str:
         """Replace known placeholder tokens in ``command`` with set values.
@@ -139,6 +175,30 @@ class Variables:
             if _token_present(command, token):
                 missing.append(var)
         return missing
+
+    def unresolved_placeholders(self, command: str) -> list[str]:
+        """Return any known placeholder tokens still present *after* substitution.
+
+        This is the safety guard the console uses before executing: it catches
+        tokens whose variable is unset (so substitution left the literal in
+        place), regardless of whether the operator remembered to set them. A
+        non-empty result means the command would run with broken literals (e.g.
+        ``-template VULN-TEMPLATE``) and must not be executed.
+
+        Returns the offending literal tokens (e.g. ``["VULN-TEMPLATE"]``) so the
+        console can name exactly what to ``set``.
+        """
+        resolved = self.substitute(command)
+        offending: list[str] = []
+        for token in _TOKEN_TO_VAR:
+            if _token_present(resolved, token) and token not in offending:
+                offending.append(token)
+        return offending
+
+    def owner(self, token: str) -> str:
+        """Return the variable name that owns a placeholder token (or the token
+        itself if unknown), so callers can tell the operator what to ``set``."""
+        return _TOKEN_TO_VAR.get(token, token)
 
     def as_rows(self) -> list[tuple[str, str, str]]:
         """Return (name, value, placeholders) rows for display in `options`."""

