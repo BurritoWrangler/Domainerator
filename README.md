@@ -20,7 +20,10 @@ It runs in two modes:
 - **Unauthenticated** — given just a target (and optionally a domain), it probes SMB
   signing, NULL sessions, anonymous share/RID enumeration, LDAP anonymous bind, LDAP
   signing / channel-binding relay exposure, WebDAV/WebClient discovery, **timeroasting**
-  (NTP computer-account hashes, no creds required), and AS-REP roasting (with a userlist).
+  (NTP computer-account hashes, no creds required), AS-REP roasting (with a userlist), and
+  "big win" network footholds — **Cisco Smart Install**, **MS17-010 (EternalBlue)**,
+  **anonymous FTP / NFS exports**, and **SNMP default community** strings — that often
+  yield reusable credentials with no domain context.
 - **Authenticated** — given a domain, username, and password (or NT hash), it adds
   password-policy review, local-admin detection, Kerberoasting, delegation
   enumeration, active **RBCD enumeration**, **coercion-surface detection**
@@ -73,6 +76,31 @@ signing / channel binding — together these form the classic HTTP-coercion → 
 - **Timeroasting** — abuses MS-SNTP to recover crackable computer-account hashes over NTP
   with no domain credentials required (`unauthenticated` → `crackable_hash` → crack →
   `valid_credentials`).
+
+### Unauthenticated "big wins": network/device footholds
+
+Some of the fastest routes to a domain foothold have nothing to do with AD directly — a
+network device or exposed service hands you credentials that are then reused against Windows.
+These checks run from a pure unauthenticated position and grant a `network_foothold`
+capability, which the path engine chains to `valid_credentials` via a credential-reuse glue
+step (`network_foothold` → `valid_credentials` → `low_priv_user`):
+
+- **Cisco Smart Install** (TCP 4786) — an exposed, unauthenticated SMI service lets you pull
+  the device's running-config, which routinely holds local/enable passwords, SNMP
+  communities, and TACACS keys that are commonly reused on the domain.
+- **MS17-010 (EternalBlue)** — unauthenticated SMB RCE; exploitation yields SYSTEM, from
+  which SAM/LSASS secrets (local-admin and cached domain creds) are dumped. The single
+  biggest unauth win when present, flagged **Critical**.
+- **Anonymous FTP / NFS exports** — low-effort, high-hit-rate sources of backups, scripts,
+  and answer files (`unattend.xml`, `web.config`) that embed reusable credentials.
+- **SNMP default community** — SNMP reachable with `public`/`private` leaks system inventory
+  and, on network gear, configuration and credentials.
+
+These are **detection only** — Domainerator reports the exposure and the operator command to
+recover/reuse the credentials; it does not pull configs, exploit EternalBlue, or spray on its
+own. The Cisco SMI, FTP/NFS, and SNMP checks use Nmap NSE scripts, so install `nmap`
+(`sudo apt install nmap`); as with every tool, a missing one just marks those checks
+*skipped* rather than aborting the run.
 
 ## Detection and guidance
 
@@ -449,6 +477,7 @@ Install the tools it drives:
 | `ntlmrelayx.py` (Impacket) | Relay listener for `relay` orchestration | `sudo apt install impacket-scripts` or `pipx install impacket` |
 | `coercer` | Coercion trigger for `relay` orchestration | `pipx install coercer` |
 | `PetitPotam.py` / `printerbug.py` / `dfscoerce.py` | Alternative coercion triggers | project scripts on PATH |
+| `nmap` | Cisco Smart Install / FTP / NFS / SNMP foothold checks | `sudo apt install nmap` |
 
 A missing tool never aborts the run — the checks that need it are reported as
 **skipped** with an install hint.

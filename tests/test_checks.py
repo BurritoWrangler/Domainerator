@@ -237,3 +237,111 @@ def test_new_checks_registered_in_run_all():
     unauth_results = unauthenticated.run_all(FakeRunner("nothing"), ANON_TARGET, timeout=60)
     unauth_names = {r.name for r in unauth_results}
     assert "Timeroasting (NTP computer-account hashes)" in unauth_names
+
+
+# --- unauthenticated "big win" network footholds ---------------------------
+
+def test_cisco_smart_install_detected_and_emits_foothold():
+    output = (
+        "4786/tcp open  smart-install\n"
+        "| cisco-smart-install: Smart Install is enabled / VULNERABLE\n"
+    )
+    res = unauthenticated.check_cisco_smart_install(FakeRunner(output), ANON_TARGET)
+    assert any("Smart Install" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_cisco_smart_install_inconclusive_when_unknown():
+    res = unauthenticated.check_cisco_smart_install(
+        FakeRunner("Note: Host seems down."), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_eternalblue_detected_and_emits_foothold():
+    output = "SMB  10.0.0.10  445  HOST  [+] HOST (name:HOST) MS17-010 VULNERABLE"
+    res = unauthenticated.check_eternalblue(FakeRunner(output), ANON_TARGET)
+    assert any("EternalBlue" in f.title or "MS17-010" in f.title for f in res.findings)
+    # Critical severity for unauth RCE.
+    assert any(f.severity.label == "Critical" for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_eternalblue_inconclusive_on_connection_failure():
+    res = unauthenticated.check_eternalblue(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_anonymous_ftp_detected():
+    output = "| ftp-anon: Anonymous FTP login allowed (FTP code 230)"
+    res = unauthenticated.check_anonymous_ftp_nfs(FakeRunner(output), ANON_TARGET)
+    assert any("Anonymous FTP" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_nfs_exports_detected():
+    output = "| nfs-showmount:\n|   /export/home 10.0.0.0/24\n"
+    res = unauthenticated.check_anonymous_ftp_nfs(FakeRunner(output), ANON_TARGET)
+    assert any("NFS" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_ftp_nfs_inconclusive_when_ports_absent():
+    res = unauthenticated.check_anonymous_ftp_nfs(
+        FakeRunner("Note: Host seems down."), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_snmp_default_community_detected():
+    output = (
+        "161/udp open  snmp\n"
+        "| snmp-brute:\n"
+        "|   public - Valid credentials\n"
+    )
+    res = unauthenticated.check_snmp_default_community(FakeRunner(output), ANON_TARGET)
+    assert any("SNMP" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_snmp_inconclusive_when_filtered():
+    res = unauthenticated.check_snmp_default_community(
+        FakeRunner("Note: Host seems down."), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_network_foothold_chains_to_domain_user():
+    # A NETWORK_FOOTHOLD (from any of the new checks) must chain via the
+    # baseline credential-reuse glue to valid credentials -> low-priv user.
+    from domainerator.paths import build_engine, starting_capabilities
+
+    smi = unauthenticated.check_cisco_smart_install(
+        FakeRunner("4786/tcp open\n| cisco-smart-install: VULNERABLE"), ANON_TARGET
+    )
+    engine = build_engine([smi])
+    paths = engine.find_paths(
+        starting_capabilities(authenticated=False),
+        goals={Capability.LOW_PRIV_USER},
+    )
+    assert paths, "network foothold should chain to a domain user via credential reuse"
+
+
+def test_new_network_checks_registered_in_run_all():
+    results = unauthenticated.run_all(FakeRunner(""), ANON_TARGET, timeout=60)
+    names = {r.name for r in results}
+    assert "Cisco Smart Install exposure (TCP 4786)" in names
+    assert "MS17-010 / EternalBlue (SMB RCE)" in names
+    assert "Anonymous FTP / NFS export exposure" in names
+    assert "SNMP default community string" in names

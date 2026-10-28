@@ -11,6 +11,9 @@ These checks probe a target the way an attacker with no foothold would:
 * NTLMv1 acceptance (crackable / downgradable authentication)
 * NTLM reflection exposure (coerced auth relayable back to the same host)
 * Kerberos pre-auth (AS-REP roastable accounts) when a userlist is known
+* "Big win" network footholds that often yield reusable credentials without
+  any domain context: Cisco Smart Install, MS17-010 (EternalBlue), anonymous
+  FTP / NFS exports, and SNMP default community strings
 
 All commands are built as argument lists and executed via ``ToolRunner`` so no
 untrusted value ever touches a shell.
@@ -818,6 +821,355 @@ def check_timeroast(runner: ToolRunner, target: Target, timeout: int = 180) -> C
     return result
 
 
+def check_cisco_smart_install(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Detect Cisco Smart Install (SMI) exposure on TCP 4786.
+
+    An exposed, unauthenticated SMI service lets an attacker pull the device's
+    running configuration, which routinely contains local/enable passwords,
+    SNMP community strings, and TACACS keys - credentials that are frequently
+    reused against the Windows/AD estate. This is a classic unauthenticated
+    "big win" foothold with no domain context required.
+    """
+    name = "Cisco Smart Install exposure (TCP 4786)"
+    skip = require_tool(runner, "nmap", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    # The vuln NSE script reports whether SMI is active/abusable.
+    argv = ["nmap", "-Pn", "-p", "4786", "--script", "cisco-smart-install", target.host]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    open_port = re.search(r"4786/tcp\s+open", text, re.IGNORECASE)
+    smi_active = re.search(r"Smart Install|SMI|is enabled|VULNERABLE", text, re.IGNORECASE)
+    if open_port and smi_active:
+        result.add_finding(
+            Finding(
+                title="Cisco Smart Install enabled and exposed",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "Cisco Smart Install is reachable and unauthenticated on "
+                    "TCP 4786. An attacker can download the device's running "
+                    "configuration (and push a new one), exposing local/enable "
+                    "passwords, SNMP communities, and TACACS keys that are "
+                    "commonly reused against the domain."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Disable Smart Install ('no vstack') where not required and "
+                    "restrict TCP 4786 to management networks."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Dump Cisco config via Smart Install -> credentials",
+                technique="Cisco-SMI",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NETWORK_FOOTHOLD,
+                command=(
+                    f"nmap -p4786 --script cisco-smart-install {target.host}  "
+                    "# or: SIET.py -i "
+                    f"{target.host} -g   (grab running-config; crack type7/type5 creds)"
+                ),
+                description=(
+                    "Pull the switch/router running-config over Smart Install "
+                    "and recover reusable credentials (type-7/type-5, SNMP, "
+                    "TACACS)."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.MODERATE,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not open_port and not re.search(r"4786", text):
+            result.mark_inconclusive(
+                "could not determine Smart Install status on TCP 4786 (host "
+                "unreachable, filtered, or nmap output changed)"
+            )
+    return result
+
+
+def check_eternalblue(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Detect MS17-010 (EternalBlue) - unauthenticated SMB RCE.
+
+    When present this is the single biggest unauthenticated win: remote code
+    execution as SYSTEM, from which SAM/LSASS secrets (local admin and cached
+    domain credentials) can be dumped. Detection only; exploitation is left to
+    the operator.
+    """
+    name = "MS17-010 / EternalBlue (SMB RCE)"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = ["nxc", "smb", target.host, "-u", "", "-p", "", "-M", "ms17-010"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    vulnerable = re.search(r"MS17-010.*VULNERABLE|VULNERABLE.*MS17-010|likely vulnerable",
+                           text, re.IGNORECASE)
+    if vulnerable:
+        result.add_finding(
+            Finding(
+                title="Host vulnerable to MS17-010 (EternalBlue)",
+                severity=Severity.CRITICAL,
+                target=target.host,
+                description=(
+                    "The host is vulnerable to MS17-010 (EternalBlue), an "
+                    "unauthenticated SMB remote-code-execution flaw. Exploiting "
+                    "it yields SYSTEM, from which SAM and LSASS secrets - local "
+                    "admin hashes and cached domain credentials - can be dumped."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Apply MS17-010 patches immediately and disable SMBv1."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="EternalBlue -> SYSTEM -> dump SAM/LSASS",
+                technique="MS17-010",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NETWORK_FOOTHOLD,
+                command=(
+                    f"# MS17-010 against {target.host} (e.g. metasploit "
+                    "ms17_010_eternalblue) -> SYSTEM -> dump SAM/LSASS for "
+                    "local-admin and cached domain creds"
+                ),
+                description=(
+                    "Exploit EternalBlue for SYSTEM on the host, then dump "
+                    "credentials for reuse against the domain."
+                ),
+                reliability=Reliability.MODERATE,
+                noise=Noise.LOUD,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"MS17-010 check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"ms17-010|not vulnerable", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "ms17-010 module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_anonymous_ftp_nfs(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Detect anonymous FTP access and exported (world-readable) NFS shares.
+
+    Both are low-effort, high-hit-rate sources of config files, backups, and
+    answer files (unattend.xml, web.config) that embed reusable credentials.
+    """
+    name = "Anonymous FTP / NFS export exposure"
+    skip = require_tool(runner, "nmap", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = [
+        "nmap", "-Pn", "-p", "21,111,2049",
+        "--script", "ftp-anon,nfs-showmount",
+        target.host,
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    ftp_anon = re.search(r"ftp-anon:.*Anonymous FTP login allowed", text, re.IGNORECASE)
+    nfs_exports = re.search(r"nfs-showmount:", text, re.IGNORECASE) and re.search(
+        r"/\S+", text
+    )
+    found = False
+    if ftp_anon:
+        found = True
+        result.add_finding(
+            Finding(
+                title="Anonymous FTP login allowed",
+                severity=Severity.MEDIUM,
+                target=target.host,
+                description=(
+                    "The FTP service permits anonymous login. Anonymous shares "
+                    "frequently hold backups, scripts, and config/answer files "
+                    "that contain reusable credentials."
+                ),
+                evidence=text[:600],
+                remediation="Disable anonymous FTP or restrict and audit its contents.",
+            )
+        )
+    if nfs_exports:
+        found = True
+        result.add_finding(
+            Finding(
+                title="NFS exports reachable (showmount)",
+                severity=Severity.MEDIUM,
+                target=target.host,
+                description=(
+                    "The host exports NFS shares that can be enumerated without "
+                    "authentication. Exported filesystems often contain home "
+                    "directories, backups, and config files with credentials."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Restrict NFS exports to specific hosts, drop no_root_squash, "
+                    "and avoid exporting sensitive paths."
+                ),
+            )
+        )
+    if found:
+        result.add_step(
+            PathStep(
+                name="Loot anonymous FTP / NFS -> credentials",
+                technique="Anon-file-share",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NETWORK_FOOTHOLD,
+                command=(
+                    f"# FTP: ftp {target.host} (anonymous)  |  "
+                    f"NFS: showmount -e {target.host} then mount and grep for "
+                    "passwords/keys in configs, backups, unattend.xml/web.config"
+                ),
+                description=(
+                    "Harvest config files, backups, and answer files from "
+                    "anonymous FTP or exported NFS shares for reusable creds."
+                ),
+                reliability=Reliability.SPECULATIVE,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"ftp-anon|nfs-showmount|21/tcp|2049/tcp", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "could not determine FTP/NFS exposure (ports filtered, host "
+                "unreachable, or nmap output changed)"
+            )
+    return result
+
+
+def check_snmp_default_community(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Detect SNMP reachable with a default community string (public/private).
+
+    SNMP v1/v2c with a guessable community leaks system inventory and, on
+    network gear, sometimes configuration/credentials. A writable 'private'
+    community can even push config. A useful unauthenticated info/credential
+    foothold.
+    """
+    name = "SNMP default community string"
+    skip = require_tool(runner, "nmap", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = [
+        "nmap", "-Pn", "-sU", "-p", "161",
+        "--script", "snmp-brute,snmp-info",
+        target.host,
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # snmp-brute reports valid community strings; snmp-info confirms a response.
+    # Use DOTALL so the brute header and the recovered community on the next
+    # line are matched together.
+    community = re.search(
+        r"snmp-brute:.*?(public|private|Valid credentials)", text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    snmp_open = re.search(r"161/udp\s+open", text, re.IGNORECASE)
+    if community or (snmp_open and re.search(r"snmp-info:", text, re.IGNORECASE)):
+        result.add_finding(
+            Finding(
+                title="SNMP accessible with a default/guessable community",
+                severity=Severity.MEDIUM,
+                target=target.host,
+                description=(
+                    "SNMP responded to a default or brute-forced community "
+                    "string. SNMP exposes system inventory and, on network "
+                    "devices, can leak configuration and credentials; a writable "
+                    "community permits configuration changes."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Use SNMPv3 with authentication/privacy, remove default "
+                    "communities, and restrict UDP 161 to management hosts."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="SNMP community -> enumerate / recover credentials",
+                technique="SNMP-default",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NETWORK_FOOTHOLD,
+                command=(
+                    f"snmpwalk -v2c -c public {target.host}  "
+                    "# enumerate; on network gear pull config/creds for reuse"
+                ),
+                description=(
+                    "Walk SNMP with the recovered community to enumerate the "
+                    "host and, on devices, recover reusable credentials."
+                ),
+                reliability=Reliability.MODERATE,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"snmp|161/udp", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "could not determine SNMP exposure (UDP 161 filtered, host "
+                "unreachable, or nmap output changed)"
+            )
+    return result
+
+
 def run_all(
     runner: ToolRunner,
     target: Target,
@@ -836,4 +1188,8 @@ def run_all(
         check_ntlm_reflection(runner, target, timeout=min(timeout, 120)),
         check_asrep_roast(runner, target, userlist, timeout=timeout),
         check_timeroast(runner, target, timeout=min(timeout, 180)),
+        check_cisco_smart_install(runner, target, timeout=min(timeout, 120)),
+        check_eternalblue(runner, target, timeout=min(timeout, 180)),
+        check_anonymous_ftp_nfs(runner, target, timeout=min(timeout, 120)),
+        check_snmp_default_community(runner, target, timeout=min(timeout, 120)),
     ]

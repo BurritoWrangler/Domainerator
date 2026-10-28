@@ -70,6 +70,7 @@ class Capability(enum.Enum):
     SELF_RELAY_TARGET = "self_relay_target"      # host vulnerable to NTLM reflection
     SCCM_MANAGEMENT_POINT = "sccm_management_point"  # discovered SCCM MP / site
     SCCM_NAA_CREDS = "sccm_naa_creds"            # recovered SCCM Network Access Account creds
+    NETWORK_FOOTHOLD = "network_foothold"        # creds/shell from a non-AD service (switch, SNMP, FTP/NFS, EternalBlue)
 
     # --- goals -----------------------------------------------------------
     DCSYNC = "dcsync"                            # can replicate secrets (near-DA)
@@ -359,6 +360,26 @@ def baseline_steps() -> list[PathStep]:
             description="Any working credential gives an authenticated domain user context.",
             reliability=Reliability.GUARANTEED,
             noise=Noise.QUIET,
+            source="baseline",
+        ),
+        PathStep(
+            name="Network/device foothold -> try credentials against the domain",
+            technique="Credential-reuse",
+            requires=frozenset({Capability.NETWORK_FOOTHOLD}),
+            grants=Capability.VALID_CREDENTIALS,
+            command=(
+                "nxc smb DC -u USER -p PASS  "
+                "# reuse creds recovered from a device/service (config, SNMP, "
+                "FTP/NFS, EternalBlue SAM) against the domain"
+            ),
+            description=(
+                "Credentials or a shell obtained from a non-AD service (network "
+                "device config, SNMP, anonymous FTP/NFS, EternalBlue SAM dump) "
+                "are frequently reused for a domain account. Spray/try them to "
+                "turn a network foothold into valid domain credentials."
+            ),
+            reliability=Reliability.SPECULATIVE,
+            noise=Noise.MODERATE,
             source="baseline",
         ),
         PathStep(

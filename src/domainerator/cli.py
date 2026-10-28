@@ -43,6 +43,7 @@ KNOWN_TOOLS = {
     "certipy": "Certipy (pipx install certipy-ad)",
     "GetNPUsers.py": "Impacket (pipx install impacket)",
     "bloodhound-python": "BloodHound-CE collector (pipx install bloodhound-ce)",
+    "nmap": "Nmap (sudo apt install nmap) - Cisco SMI / FTP / NFS / SNMP checks",
 }
 
 
