@@ -55,6 +55,7 @@ class EvidenceWriter:
         self._counter = 0
         self._exec_counter = 0
         self._created = False
+        self._loot_store = None
 
     # --- directories -----------------------------------------------------
     @property
@@ -65,10 +66,22 @@ class EvidenceWriter:
     def evidence_dir(self) -> Path:
         return self.run_dir / "evidence"
 
+    @property
+    def loot_dir(self) -> Path:
+        return self.run_dir / "loot"
+
     def _ensure(self) -> None:
         if not self._created:
             self.evidence_dir.mkdir(parents=True, exist_ok=True)
             self._created = True
+
+    def loot_store(self):
+        """Return a :class:`~domainerator.loot.LootStore` for this run's loot/."""
+        if self._loot_store is None:
+            from .loot import LootStore
+
+            self._loot_store = LootStore(self.loot_dir)
+        return self._loot_store
 
     # --- writers ---------------------------------------------------------
     def write_result(self, result: CheckResult, *, target: str = "") -> Path | None:

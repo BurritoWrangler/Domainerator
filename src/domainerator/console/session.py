@@ -91,6 +91,30 @@ class Session:
                 self.loot.append(item)
                 self.modified = True
 
+    def capture_loot(self, output: str) -> list:
+        """Extract typed loot from ``output``, record it, and persist to disk.
+
+        Returns the list of newly-seen :class:`~domainerator.loot.LootItem`.
+        Loot is kept in memory (for ``show loot``) and, when an evidence writer
+        is configured, written to per-kind files under the run's ``loot/`` dir
+        (cleartext creds, NTLM/Kerberos/other hashes) in crackable formats.
+        """
+        from ..loot import extract_loot
+
+        items = extract_loot(output)
+        if not items:
+            return []
+        # In-memory record (string form), de-duplicated.
+        self.add_loot([str(i) for i in items])
+        # Persist to the loot store when an output folder is configured.
+        newly: list = items
+        if self.evidence is not None:
+            try:
+                newly = self.evidence.loot_store().add(items)
+            except OSError:
+                newly = items
+        return newly
+
     def add_result(self, result: CheckResult) -> None:
         """Add a check result and update capabilities."""
         self.check_results.append(result)

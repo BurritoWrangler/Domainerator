@@ -497,6 +497,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"\nEvidence for {len(written)} check(s) written to "
                 f"{evidence.run_dir}"
             )
+            # Harvest loot (hashes/cleartext creds) from check output into the
+            # run's loot/ folder, in crackable per-kind files.
+            from .loot import extract_loot
+
+            loot_items = []
+            for r in all_results:
+                loot_items.extend(extract_loot(r.raw_output or ""))
+            if loot_items:
+                new_loot = evidence.loot_store().add(loot_items)
+                if new_loot:
+                    print(
+                        f"Loot: {len(new_loot)} item(s) (hashes/credentials) "
+                        f"written to {evidence.loot_dir}"
+                    )
         except OSError as exc:
             logger.warning("could not write evidence: %s", exc)
             evidence = None

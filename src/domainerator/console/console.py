@@ -805,9 +805,9 @@ class Console:
         outcome = outcomes.interpret(step.technique, step.grants, out.combined)
         self._capture_execution(step.technique, out.command, out.combined, outcome.success)
 
-        if outcome.loot:
-            self.session.add_loot(outcome.loot)
-            print(f"Captured {len(outcome.loot)} loot item(s) (see 'show loot').")
+        newly = self.session.capture_loot(out.combined)
+        if newly:
+            self._report_loot(newly)
 
         if outcome.success and outcome.capability is not None:
             print(f"[+] Success: granting capability '{outcome.capability.value}'.")
@@ -838,6 +838,17 @@ class Console:
             print(f"    Evidence saved: {path}")
         except OSError as exc:
             print(f"    (could not write evidence: {exc})")
+
+    def _report_loot(self, items: list) -> None:
+        """Announce newly-captured loot and where it was written."""
+        # Summarise by kind.
+        by_kind: dict[str, int] = {}
+        for it in items:
+            by_kind[it.kind.value] = by_kind.get(it.kind.value, 0) + 1
+        summary = ", ".join(f"{n} {k}" for k, n in by_kind.items())
+        print(f"    Loot captured: {summary} (see 'show loot').")
+        if self.session.evidence is not None:
+            print(f"    Loot saved to: {self.session.evidence.loot_dir}")
 
     def _copy_command(self, command: str) -> None:
         """Copy command to clipboard."""
@@ -1086,10 +1097,9 @@ class Console:
         )
 
         # Capture any loot from the relay output.
-        loot = outcomes._extract_loot(result.relay_output)
-        if loot:
-            self.session.add_loot(loot)
-            print(f"Captured {len(loot)} loot item(s) (see 'show loot').")
+        newly = self.session.capture_loot(result.relay_output)
+        if newly:
+            self._report_loot(newly)
 
         if result.success and result.capability is not None:
             print(f"[+] {result.detail}")

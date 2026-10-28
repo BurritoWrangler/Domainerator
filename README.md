@@ -151,7 +151,7 @@ The console provides:
 - **Reactive capability tracking** — successful step output auto-grants the resulting capability and recomputes paths
 - **Relay orchestration** — `relay` coordinates a background `ntlmrelayx` listener with a coercion trigger as one action
 - **Multi-target sessions** — `targets`/`target <id>` switch the active host among everything you scanned
-- **Loot capture** — hashes, tickets, and certs are extracted from output into `show loot`
+- **Loot capture** — cleartext creds and hashes are extracted into `show loot` and saved to a per-kind `loot/` folder (crackable formats) under `--output-dir`
 - **Session persistence** — `save` persists state for iterative foothold→DA workflows
 
 ### Console commands
@@ -774,6 +774,14 @@ engagement/
     │   ├── 003_authenticated_gpp-cpassword-in-sysvol.txt
     │   ├── exec_001_kerberoast.txt        # commands run in the console
     │   └── exec_002_relay-ldap-rbcd.txt   # relay orchestration transcripts
+    ├── loot/                              # harvested credentials & hashes
+    │   ├── cleartext.txt                  # domain\user:password, user:password
+    │   ├── ntlm_hash.txt                  # user:rid:lm:nt:::        (hashcat -m 1000)
+    │   ├── kerberos_tgs.txt               # $krb5tgs$                (hashcat -m 13100)
+    │   ├── kerberos_asrep.txt             # $krb5asrep$              (hashcat -m 18200)
+    │   ├── netntlm.txt                    # NetNTLMv1/v2 captures    (hashcat -m 5600)
+    │   ├── timeroast.txt                  # $sntp-ms$                (hashcat -m 31300)
+    │   └── ipmi_hash.txt                  # IPMI RAKP                (hashcat -m 7300)
     ├── report.md
     └── report.json
 ```
@@ -783,6 +791,24 @@ same as everywhere else. In `--console` mode, every command you execute (includi
 orchestration) is captured as an `exec_*.txt` file, and the `report` command regenerates
 `report.md`/`report.json` from the live session state into the same run folder — so after
 interactive work you get a deliverable that reflects everything you actually did.
+
+### Loot folder
+
+Cleartext credentials, hashes, and tickets found in tool output — whether from the initial
+scan or a command you run in the console — are harvested into a dedicated `loot/` folder,
+**separate from the evidence screenshots** because this material is machine-usable. Each
+kind lands in its own file, de-duplicated, with a one-line header naming the hashcat mode,
+so you can feed them straight into cracking or reuse:
+
+```bash
+hashcat -m 13100 engagement/run-*/loot/kerberos_tgs.txt rockyou.txt   # crack Kerberoast
+nxc smb 10.0.0.0/24 -u users.txt -p engagement/run-*/loot/cleartext.txt  # reuse/spray
+```
+
+Loot files append across the run and de-duplicate (re-running a check won't double up a
+hash). In the console, `show loot` lists what's been captured in-session; with `--output-dir`
+set it is also persisted to `loot/`. Treat this folder as highly sensitive — it is covered
+by the `.gitignore` loot patterns so it never lands in a commit.
 
 ## How it works
 
@@ -833,6 +859,7 @@ domainerator/
 │   ├── bloodhound.py       # BloodHound-CE collection/ingestion -> PathSteps
 │   ├── report.py           # JSON / Markdown / console rendering
 │   ├── evidence.py         # per-check / per-execution evidence files (screenshots)
+│   ├── loot.py             # typed loot extraction + per-kind loot/ files
 │   ├── console/            # interactive Metasploit-style console
 │   │   ├── console.py      # REPL loop + command dispatcher
 │   │   ├── session.py      # runtime state + capability tracking

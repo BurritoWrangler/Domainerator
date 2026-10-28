@@ -130,3 +130,43 @@ def test_capture_execution_noop_without_evidence(tmp_path):
     console = Console(session)
     # Should not raise when no evidence writer is configured.
     console._capture_execution("Kerberoast", "cmd", "out", True)
+
+
+# --- session loot capture -> loot/ folder ----------------------------------
+
+def test_session_capture_loot_writes_to_loot_dir(tmp_path):
+    ev = EvidenceWriter(tmp_path, run_stamp="run-x")
+    target = Target(host="dc01", domain="corp.local")
+    session = Session(runner=ToolRunner(dry_run=True), target=target,
+                      targets=[target], evidence=ev)
+    out = (
+        "SMB 10.0.0.10 [+] CORP\\alice:Summer2024!\n"
+        "krbtgt:502:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::\n"
+    )
+    newly = session.capture_loot(out)
+    assert len(newly) == 2
+    # Persisted to per-kind files under loot/.
+    assert (ev.loot_dir / "cleartext.txt").exists()
+    assert (ev.loot_dir / "ntlm_hash.txt").exists()
+    # Also tracked in memory for 'show loot'.
+    assert session.loot
+
+
+def test_session_capture_loot_dedupes_on_disk(tmp_path):
+    ev = EvidenceWriter(tmp_path, run_stamp="run-x")
+    target = Target(host="dc01", domain="corp.local")
+    session = Session(runner=ToolRunner(dry_run=True), target=target,
+                      targets=[target], evidence=ev)
+    out = "$krb5tgs$23$*svc*CORP*$abcdef"
+    assert len(session.capture_loot(out)) == 1
+    assert len(session.capture_loot(out)) == 0
+
+
+def test_session_capture_loot_without_evidence_is_in_memory_only(tmp_path):
+    target = Target(host="h", domain="corp.local")
+    session = Session(runner=ToolRunner(dry_run=True), target=target, targets=[target])
+    items = session.capture_loot(
+        "krbtgt:502:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::"
+    )
+    assert items          # returned the extracted items
+    assert session.loot   # kept in memory
