@@ -363,6 +363,21 @@ def baseline_steps() -> list[PathStep]:
             source="baseline",
         ),
         PathStep(
+            name="Crack an offline hash -> credentials",
+            technique="Hash-crack",
+            requires=frozenset({Capability.CRACKABLE_HASH}),
+            grants=Capability.VALID_CREDENTIALS,
+            command="hashcat <hash-file> <wordlist>  # crack the recovered hash offline",
+            description=(
+                "Any recovered crackable hash (NetNTLMv2 from poisoning, an IPMI "
+                "BMC hash, a captured NTLMv1, etc.) can be cracked offline to "
+                "recover a plaintext credential for reuse."
+            ),
+            reliability=Reliability.SPECULATIVE,
+            noise=Noise.QUIET,
+            source="baseline",
+        ),
+        PathStep(
             name="Network/device foothold -> try credentials against the domain",
             technique="Credential-reuse",
             requires=frozenset({Capability.NETWORK_FOOTHOLD}),

@@ -91,10 +91,28 @@ step (`network_foothold` → `valid_credentials` → `low_priv_user`):
 - **MS17-010 (EternalBlue)** — unauthenticated SMB RCE; exploitation yields SYSTEM, from
   which SAM/LSASS secrets (local-admin and cached domain creds) are dumped. The single
   biggest unauth win when present, flagged **Critical**.
+- **SMBGhost (CVE-2020-0796)** — unauthenticated SMBv3.1.1 compression RCE (Win10/Server
+  1903–1909); like EternalBlue, a hit means SYSTEM → local-admin / cached domain creds.
+- **PrintNightmare / exposed spooler (MS-RPRN)** — a reachable Print Spooler is both a
+  CVE-2021-34527 RCE vector and a **coercion source**: it grants `coercible_auth`, which the
+  path engine wires straight into the relay chains (relay to LDAP for RBCD/shadow creds, or
+  to AD CS for ESC8) — so from zero creds an exposed spooler + an unsigned DC LDAP chains to
+  RBCD automatically.
+- **IPMI hash disclosure (CVE-2013-4786)** — IPMI 2.0 BMCs (iDRAC/iLO/Supermicro) hand a
+  salted RAKP password hash to any unauthenticated requester; crack it offline (hashcat mode
+  7300) for reusable BMC/server credentials.
+- **LLMNR / NBT-NS / mDNS poisoning exposure** — flags broadcast name-resolution left
+  enabled, the classic Responder capture → NetNTLMv2 crack/relay opportunity.
 - **Anonymous FTP / NFS exports** — low-effort, high-hit-rate sources of backups, scripts,
   and answer files (`unattend.xml`, `web.config`) that embed reusable credentials.
 - **SNMP default community** — SNMP reachable with `public`/`private` leaks system inventory
   and, on network gear, configuration and credentials.
+
+Credential-yielding footholds (IPMI, name-resolution poisoning, and others that produce a
+hash) grant `crackable_hash`, which chains through a baseline **crack → `valid_credentials`**
+glue; RCE footholds (EternalBlue, SMBGhost, Cisco SMI, FTP/NFS, SNMP) grant
+`network_foothold` and chain through credential reuse. Either way, a network/device win feeds
+straight into the domain path search.
 
 These are **detection only** — Domainerator reports the exposure and the operator command to
 recover/reuse the credentials; it does not pull configs, exploit EternalBlue, or spray on its

