@@ -64,6 +64,7 @@ class Console:
             "unset": self.cmd_unset,
             "options": self.cmd_options,
             "grant": self.cmd_grant,
+            "loot": self.cmd_loot,
             "targets": self.cmd_targets,
             "target": self.cmd_target,
             "relay": self.cmd_relay,
@@ -123,6 +124,8 @@ class Console:
                         str(i) for i in range(len(self.session.targets))
                         if str(i).startswith(text)
                     ]
+                elif parts[0] == "loot" and len(parts) == 2:
+                    self.completions = [s for s in ["export"] if s.startswith(text)]
                 else:
                     self.completions = []
 
@@ -228,6 +231,10 @@ class Console:
         print()
         print("Capabilities:")
         print("  grant <capability>   Manually mark a capability as obtained")
+        print()
+        print("Loot:")
+        print("  loot                 List captured credentials/hashes (same as 'show loot')")
+        print("  loot export [dir]    Write captured loot to per-kind files in a folder")
         print()
         print("Targets:")
         print("  targets              List all scanned hosts and the active one")
@@ -1197,6 +1204,55 @@ class Console:
             shown = item if len(item) <= 100 else item[:97] + "..."
             print(f"  [{i}] {shown}")
         print()
+
+    def cmd_loot(self, args: list[str]) -> None:
+        """List or export captured loot.
+
+        Usage:
+          loot                 List captured loot (same as 'show loot')
+          loot export [dir]    Write loot to per-kind files (crackable formats)
+                               in <dir>; defaults to the run's loot/ folder when
+                               --output-dir is set, else ./loot.
+        """
+        if not args:
+            self._show_loot()
+            return
+
+        action = args[0].lower()
+        if action != "export":
+            print(f"Unknown loot subcommand: {action}")
+            print("Usage: loot [export [dir]]")
+            return
+
+        items = self.session.loot_items
+        if not items:
+            print("No loot to export yet.")
+            return
+
+        # Resolve destination: explicit arg > evidence run loot/ > ./loot.
+        from pathlib import Path
+
+        from ..loot import LootStore
+
+        if len(args) >= 2:
+            dest = Path(args[1])
+        elif self.session.evidence is not None:
+            dest = self.session.evidence.loot_dir
+        else:
+            dest = Path("loot")
+
+        try:
+            store = LootStore(dest)
+            written = store.add(items)
+        except OSError as exc:
+            print(f"Could not write loot: {exc}")
+            return
+
+        by_kind: dict[str, int] = {}
+        for it in items:
+            by_kind[it.kind.value] = by_kind.get(it.kind.value, 0) + 1
+        summary = ", ".join(f"{n} {k}" for k, n in by_kind.items())
+        print(f"Exported loot to {dest}  ({summary}; {len(written)} new)")
 
     # Check categories that can be run from the console.
     _SCAN_CATEGORIES = ("unauthenticated", "authenticated", "adcs", "sccm")

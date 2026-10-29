@@ -170,3 +170,57 @@ def test_session_capture_loot_without_evidence_is_in_memory_only(tmp_path):
     )
     assert items          # returned the extracted items
     assert session.loot   # kept in memory
+
+
+# --- console 'loot' command -------------------------------------------------
+
+def _looted_session(evidence=None):
+    target = Target(host="dc01", domain="corp.local")
+    session = Session(runner=ToolRunner(dry_run=True), target=target,
+                      targets=[target], evidence=evidence)
+    session.capture_loot(
+        "SMB [+] CORP\\alice:Summer2024!\n"
+        "krbtgt:502:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::\n"
+        "$krb5tgs$23$*svc*CORP*$abcdef"
+    )
+    return session
+
+
+def test_loot_command_lists_when_no_args(capsys):
+    console = Console(_looted_session())
+    console.cmd_loot([])
+    out = capsys.readouterr().out
+    assert "Collected loot" in out
+    assert "CORP\\alice:Summer2024!" in out
+
+
+def test_loot_export_to_explicit_dir(tmp_path):
+    console = Console(_looted_session())
+    dest = tmp_path / "exported"
+    console.cmd_loot(["export", str(dest)])
+    # All three kinds exported, including the cleartext credential.
+    assert (dest / "cleartext.txt").exists()
+    assert (dest / "ntlm_hash.txt").exists()
+    assert (dest / "kerberos_tgs.txt").exists()
+    assert "CORP\\alice:Summer2024!" in (dest / "cleartext.txt").read_text()
+
+
+def test_loot_export_defaults_to_evidence_loot_dir(tmp_path):
+    ev = EvidenceWriter(tmp_path, run_stamp="run-x")
+    console = Console(_looted_session(evidence=ev))
+    console.cmd_loot(["export"])
+    assert (ev.loot_dir / "cleartext.txt").exists()
+
+
+def test_loot_export_with_no_loot(capsys):
+    target = Target(host="dc01", domain="corp.local")
+    session = Session(runner=ToolRunner(dry_run=True), target=target, targets=[target])
+    console = Console(session)
+    console.cmd_loot(["export"])
+    assert "No loot to export" in capsys.readouterr().out
+
+
+def test_loot_rejects_unknown_subcommand(capsys):
+    console = Console(_looted_session())
+    console.cmd_loot(["bogus"])
+    assert "Unknown loot subcommand" in capsys.readouterr().out

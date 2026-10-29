@@ -44,8 +44,11 @@ class Session:
     # Operator-settable variables for command substitution.
     variables: Variables = field(default_factory=Variables)
 
-    # Loot collected from executed step output (hashes, tickets, certs).
+    # Loot collected from executed step output (hashes, tickets, creds).
+    # ``loot`` is the string view (used by ``show loot``); ``loot_items`` keeps
+    # the typed LootItem objects so export doesn't have to re-classify.
     loot: list[str] = field(default_factory=list)
+    loot_items: list = field(default_factory=list)
 
     # Optional evidence writer: when set, executed steps and generated reports
     # are saved to the engagement output folder for report screenshots.
@@ -104,8 +107,13 @@ class Session:
         items = extract_loot(output)
         if not items:
             return []
-        # In-memory record (string form), de-duplicated.
+        # In-memory record: string view for 'show loot' + typed items for export.
         self.add_loot([str(i) for i in items])
+        seen_typed = {(i.kind, i.value) for i in self.loot_items}
+        for i in items:
+            if (i.kind, i.value) not in seen_typed:
+                self.loot_items.append(i)
+                seen_typed.add((i.kind, i.value))
         # Persist to the loot store when an output folder is configured.
         newly: list = items
         if self.evidence is not None:

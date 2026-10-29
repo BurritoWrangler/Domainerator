@@ -175,6 +175,8 @@ The console provides:
 | `unset <NAME>` | Clear a variable |
 | `options` | Show all variables and the placeholders they fill |
 | `grant <capability>` | Manually mark a capability as obtained (recomputes paths) |
+| `loot` | List captured credentials/hashes (same as `show loot`) |
+| `loot export [dir]` | Write captured loot to per-kind files (crackable formats) |
 | `targets` | List all scanned hosts and mark the active one |
 | `target <id>` | Switch the active target to a scanned host |
 | `relay [mode] [method]` | Coordinate a background ntlmrelayx listener with a coercion trigger |
@@ -806,9 +808,12 @@ nxc smb 10.0.0.0/24 -u users.txt -p engagement/run-*/loot/cleartext.txt  # reuse
 ```
 
 Loot files append across the run and de-duplicate (re-running a check won't double up a
-hash). In the console, `show loot` lists what's been captured in-session; with `--output-dir`
-set it is also persisted to `loot/`. Treat this folder as highly sensitive — it is covered
-by the `.gitignore` loot patterns so it never lands in a commit.
+hash). In the console, `show loot` (or `loot`) lists what's been captured in-session; with
+`--output-dir` set it is also persisted to `loot/` automatically. You can dump the
+in-session loot on demand at any time with **`loot export [dir]`** — handy when you didn't
+start with `--output-dir`; it defaults to the run's `loot/` folder when one exists, otherwise
+`./loot`. Treat this folder as highly sensitive — it is covered by the `.gitignore` loot
+patterns so it never lands in a commit.
 
 ## How it works
 
