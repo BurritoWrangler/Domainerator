@@ -18,6 +18,22 @@ Layout::
         report.md                        # written by the report command
         report.json
 
+When results are attributed to more than one host (multi-target scans), evidence
+is instead split into a per-host subfolder so a reviewer can sort/skim findings
+one host at a time::
+
+    <output-dir>/
+      run-YYYYMMDD-HHMMSS/
+        evidence/
+          10.0.0.10/
+            001_unauthenticated_smb-signing-posture.txt
+            ...
+          10.0.0.20/
+            001_unauthenticated_smb-signing-posture.txt
+            ...
+        report.md
+        report.json
+
 Each evidence file has a small header (check name, category, target, command,
 status, timestamp) followed by the raw tool output, so a single screenshot
 carries enough context to stand on its own in a report.
@@ -54,6 +70,10 @@ class EvidenceWriter:
         self.run_stamp = run_stamp or datetime.now().strftime("run-%Y%m%d-%H%M%S")
         self._counter = 0
         self._exec_counter = 0
+        # Per-host counters, used when results are written into per-host
+        # subfolders (see write_results_by_host) so each host's files are
+        # numbered independently from 001.
+        self._host_counters: dict[str, int] = {}
         self._created = False
         self._loot_store = None
 
@@ -74,6 +94,12 @@ class EvidenceWriter:
         if not self._created:
             self.evidence_dir.mkdir(parents=True, exist_ok=True)
             self._created = True
+
+    def host_dir(self, host: str) -> Path:
+        """Return the per-host evidence subfolder for ``host``, creating it."""
+        d = self.evidence_dir / _slug(host or "unknown-host")
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def loot_store(self):
         """Return a :class:`~domainerator.loot.LootStore` for this run's loot/."""
@@ -96,6 +122,20 @@ class EvidenceWriter:
         path.write_text(self._render_result(result, target), encoding="utf-8")
         return path
 
+    def _write_result_in(
+        self, directory: Path, host: str, result: CheckResult
+    ) -> Path | None:
+        """Like :meth:`write_result` but into an explicit directory, with a
+        counter kept independently per-directory (keyed by ``host``)."""
+        if result.skipped:
+            return None
+        n = self._host_counters.get(host, 0) + 1
+        self._host_counters[host] = n
+        fname = f"{n:03d}_{_slug(result.category)}_{_slug(result.name)}.txt"
+        path = directory / fname
+        path.write_text(self._render_result(result, host), encoding="utf-8")
+        return path
+
     def write_results(self, results: list[CheckResult], *, target: str = "") -> list[Path]:
         """Write evidence for a list of results; returns the paths written."""
         written: list[Path] = []
@@ -103,6 +143,30 @@ class EvidenceWriter:
             p = self.write_result(r, target=target)
             if p is not None:
                 written.append(p)
+        return written
+
+    def write_results_by_host(
+        self, per_host: dict[str, list[CheckResult]]
+    ) -> dict[str, list[Path]]:
+        """Write evidence grouped into one subfolder per host.
+
+        ``per_host`` maps a host label to the :class:`CheckResult` list for
+        that host (e.g. the ``scan_targets`` return value). Each host gets its
+        own ``evidence/<host>/`` folder with independently-numbered files, so
+        a multi-target run can be reviewed one host at a time instead of
+        wading through a single flat, interleaved folder.
+
+        Returns a dict of host -> list of paths written (skipped checks are
+        omitted, same as :meth:`write_result`).
+        """
+        written: dict[str, list[Path]] = {}
+        for host, results in per_host.items():
+            paths: list[Path] = []
+            for r in results:
+                p = self._write_result_in(self.host_dir(host), host, r)
+                if p is not None:
+                    paths.append(p)
+            written[host] = paths
         return written
 
     def write_execution(

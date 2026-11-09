@@ -483,18 +483,29 @@ def main(argv: list[str] | None = None) -> int:
     evidence: EvidenceWriter | None = None
     if args.output_dir:
         evidence = EvidenceWriter(args.output_dir)
-        # Attribute each result to its host where we can (per-host results were
-        # aggregated into all_results; use the single target label otherwise).
-        host_label = target_hosts[0] if len(target_hosts) == 1 else ""
         try:
-            written = evidence.write_results(all_results, target=host_label)
+            if len(target_hosts) == 1:
+                # Single target: keep the flat evidence/ layout (no per-host
+                # subfolder needed since there's only one host).
+                host_label = target_hosts[0]
+                written_paths = evidence.write_results(all_results, target=host_label)
+            else:
+                # Multi-target: split evidence into one subfolder per host so
+                # a reviewer can go through findings host-by-host, plus a
+                # domain-wide bucket for BloodHound results (not tied to a
+                # single host).
+                by_host = {host: results for host, results in per_host.items()}
+                if bh_results:
+                    by_host["_domain-wide"] = bh_results
+                written_by_host = evidence.write_results_by_host(by_host)
+                written_paths = [p for paths in written_by_host.values() for p in paths]
             # Also drop the reports into the run folder for a single bundle.
             evidence.write_text(
                 "report.md", report.to_markdown(include_raw=args.include_raw)
             )
             evidence.write_text("report.json", report.to_json())
             print(
-                f"\nEvidence for {len(written)} check(s) written to "
+                f"\nEvidence for {len(written_paths)} check(s) written to "
                 f"{evidence.run_dir}"
             )
             # Harvest loot (hashes/cleartext creds) from check output into the

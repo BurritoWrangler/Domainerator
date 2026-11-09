@@ -794,6 +794,32 @@ orchestration) is captured as an `exec_*.txt` file, and the `report` command reg
 `report.md`/`report.json` from the live session state into the same run folder — so after
 interactive work you get a deliverable that reflects everything you actually did.
 
+#### Multi-target scans: evidence grouped per host
+
+When a run covers more than one host (`--targets hosts.txt`, or repeated `--target`),
+`evidence/` splits into one subfolder per host instead of a single flat, interleaved
+folder — so a reviewer can go through one host's findings at a time. Each host's files are
+numbered independently starting at `001`, and a domain-wide BloodHound result (not tied to
+a single host) lands in its own `_domain-wide/` bucket:
+
+```
+engagement/
+└── run-20260917-214717/
+    ├── evidence/
+    │   ├── 10.0.0.10/
+    │   │   ├── 001_unauthenticated_smb-signing-posture.txt
+    │   │   └── 002_authenticated_kerberoastable-service-accounts.txt
+    │   ├── 10.0.0.20/
+    │   │   └── 001_unauthenticated_smb-signing-posture.txt
+    │   └── _domain-wide/
+    │       └── 001_bloodhound_collection.txt
+    ├── report.md
+    └── report.json
+```
+
+Single-target runs keep the original flat layout shown above (no subfolder needed for one
+host).
+
 ### Loot folder
 
 Cleartext credentials, hashes, and tickets found in tool output — whether from the initial

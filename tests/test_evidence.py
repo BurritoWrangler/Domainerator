@@ -56,6 +56,42 @@ def test_evidence_numbers_files_sequentially(tmp_path):
     assert names[1].startswith("002_")
 
 
+def test_evidence_write_results_by_host_creates_per_host_subfolders(tmp_path):
+    w = EvidenceWriter(tmp_path, run_stamp="run-x")
+    per_host = {
+        "10.0.0.10": [_finding_result(), _finding_result()],
+        "10.0.0.20": [_finding_result()],
+    }
+    written = w.write_results_by_host(per_host)
+
+    assert set(written.keys()) == {"10.0.0.10", "10.0.0.20"}
+    assert len(written["10.0.0.10"]) == 2
+    assert len(written["10.0.0.20"]) == 1
+
+    host_dirs = {p.name for p in w.evidence_dir.iterdir()}
+    assert host_dirs == {"10-0-0-10", "10-0-0-20"}
+
+    # Numbering restarts per host (independent counters), both starting at 001.
+    names_a = sorted(p.name for p in (w.evidence_dir / "10-0-0-10").glob("*.txt"))
+    names_b = sorted(p.name for p in (w.evidence_dir / "10-0-0-20").glob("*.txt"))
+    assert names_a[0].startswith("001_")
+    assert names_a[1].startswith("002_")
+    assert names_b[0].startswith("001_")
+
+    # Each file's header reflects its own host, not another host's.
+    text_a = (w.evidence_dir / "10-0-0-10" / names_a[0]).read_text()
+    assert "Target: 10.0.0.10" in text_a
+    text_b = (w.evidence_dir / "10-0-0-20" / names_b[0]).read_text()
+    assert "Target: 10.0.0.20" in text_b
+
+
+def test_evidence_write_results_by_host_skips_skipped_checks(tmp_path):
+    w = EvidenceWriter(tmp_path, run_stamp="run-x")
+    skipped = CheckResult(name="s", category="authenticated", skipped=True, skip_reason="no creds")
+    written = w.write_results_by_host({"10.0.0.10": [skipped]})
+    assert written["10.0.0.10"] == []
+
+
 def test_evidence_write_execution(tmp_path):
     w = EvidenceWriter(tmp_path, run_stamp="run-x")
     path = w.write_execution(
