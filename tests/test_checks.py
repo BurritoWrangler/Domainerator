@@ -18,6 +18,7 @@ class FakeRunner:
     def __init__(self, combined: str = "", error: str | None = None):
         self._combined = combined
         self._error = error
+        self.dry_run = False
 
     def is_available(self, name: str) -> bool:  # all tools "present"
         return True
@@ -87,6 +88,182 @@ def test_coercion_detects_and_emits_step():
 def test_coercion_quiet_when_not_vulnerable():
     res = authenticated.check_coercion(FakeRunner("SMB 10.0.0.10  nothing"), AUTH_TARGET)
     assert not res.findings
+
+
+# --- Phase 1 roadmap: Zerologon, Kerberos user enum, DNS zone transfer -----
+
+def test_zerologon_detects_vulnerable_dc_and_grants_dcsync():
+    output = "SMB  10.0.0.10  445  DC01  [+] Vulnerable to Zerologon (CVE-2020-1472)"
+    res = unauthenticated.check_zerologon(FakeRunner(output), ANON_TARGET)
+    assert any("Zerologon" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.DCSYNC in grants
+
+
+def test_zerologon_quiet_when_not_vulnerable():
+    output = "SMB  10.0.0.10  445  DC01  [-] not vulnerable to zerologon"
+    res = unauthenticated.check_zerologon(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+    assert not res.path_steps
+
+
+def test_zerologon_skips_without_nxc():
+    class NoTool(FakeRunner):
+        def is_available(self, name):
+            return False
+
+    res = unauthenticated.check_zerologon(NoTool(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_kerberos_user_enum_confirms_users_and_grants_userlist():
+    output = (
+        "2024/01/01 00:00:00 >  [+] VALID USERNAME:       jsmith@corp.local\n"
+        "2024/01/01 00:00:00 >  [+] VALID USERNAME:       asmith@corp.local\n"
+    )
+    res = unauthenticated.check_kerberos_user_enum(
+        FakeRunner(output), ANON_TARGET, userlist="candidates.txt"
+    )
+    assert any("Kerberos pre-auth" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.USER_LIST in grants
+
+
+def test_kerberos_user_enum_skips_without_userlist():
+    res = unauthenticated.check_kerberos_user_enum(FakeRunner(""), ANON_TARGET, userlist=None)
+    assert res.skipped
+
+
+def test_kerberos_user_enum_skips_without_domain():
+    target = Target(host="10.0.0.10")
+    res = unauthenticated.check_kerberos_user_enum(
+        FakeRunner(""), target, userlist="candidates.txt"
+    )
+    assert res.skipped
+
+
+def test_dns_zone_transfer_detects_axfr_and_grants_host_list():
+    output = (
+        "corp.local.\t\t3600\tIN\tSOA\tdc01.corp.local. hostmaster.corp.local.\n"
+        "dc01.corp.local.\t3600\tIN\tA\t10.0.0.10\n"
+        "sql01.corp.local.\t3600\tIN\tA\t10.0.0.20\n"
+        "ca01.corp.local.\t3600\tIN\tA\t10.0.0.30\n"
+        ";; XFR size: 4 records\n"
+    )
+    res = unauthenticated.check_dns_zone_transfer(FakeRunner(output), ANON_TARGET)
+    assert any("zone transfer" in f.title.lower() for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.HOST_LIST in grants
+
+
+def test_dns_zone_transfer_quiet_when_refused():
+    output = "; Transfer failed.\n"
+    res = unauthenticated.check_dns_zone_transfer(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+    assert not res.path_steps
+
+
+def test_dns_zone_transfer_skips_without_domain():
+    target = Target(host="10.0.0.10")
+    res = unauthenticated.check_dns_zone_transfer(FakeRunner(""), target)
+    assert res.skipped
+
+
+# --- Phase 2 roadmap: LAPS, gMSA, DnsAdmins, Shadow Creds, Certifried ------
+
+def test_laps_readability_detects_password_and_grants_capability():
+    output = "LDAP  10.0.0.10  LAPS  WS01$: Password: Sup3rS3cr3t!"
+    res = authenticated.check_laps_readability(FakeRunner(output), AUTH_TARGET)
+    assert any("LAPS" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.LAPS_READABLE in grants
+
+
+def test_laps_readability_skips_without_creds():
+    res = authenticated.check_laps_readability(FakeRunner(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_gmsa_readability_decodes_hash_and_grants_capability():
+    output = "LDAP  10.0.0.10  GMSA  Account: svc_app$   NTLM: aad3b435b51404eeaad3b435b51404ee"
+    res = authenticated.check_gmsa_readability(FakeRunner(output), AUTH_TARGET)
+    assert any("gMSA" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.GMSA_READABLE in grants
+
+
+def test_gmsa_readability_quiet_when_no_gmsa_present():
+    res = authenticated.check_gmsa_readability(
+        FakeRunner("LDAP 10.0.0.10  no gmsa accounts found"), AUTH_TARGET
+    )
+    assert not res.findings
+    assert not res.path_steps
+
+
+def test_dnsadmins_membership_detects_members_and_grants_capability():
+    output = "LDAP  10.0.0.10  member: CN=bob,CN=Users,DC=corp,DC=local"
+    res = authenticated.check_dnsadmins_membership(FakeRunner(output), AUTH_TARGET)
+    assert any("DnsAdmins" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.DNSADMINS_MEMBER in grants
+
+
+def test_dnsadmins_membership_skips_without_creds():
+    res = authenticated.check_dnsadmins_membership(FakeRunner(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_shadow_credentials_writable_detects_success_and_grants_capability():
+    output = "[*] Updated the msDS-KeyCredentialLink attribute of the target object\n[*] Saved PFX to alice.pfx"
+    res = authenticated.check_shadow_credentials_writable(FakeRunner(output), AUTH_TARGET)
+    assert any("Shadow Credentials" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.SHADOW_CRED_WRITABLE in grants
+
+
+def test_shadow_credentials_writable_skips_without_creds():
+    res = authenticated.check_shadow_credentials_writable(FakeRunner(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_certifried_flags_nonzero_maq_and_grants_cert_as_da():
+    output = "LDAP  10.0.0.10  MAQ  MachineAccountQuota: 10"
+    res = authenticated.check_certifried(FakeRunner(output), AUTH_TARGET)
+    assert any("Certifried" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.CERT_AS_DA in grants
+
+
+def test_certifried_quiet_when_maq_is_zero():
+    output = "LDAP  10.0.0.10  MAQ  MachineAccountQuota: 0"
+    res = authenticated.check_certifried(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+    assert not res.path_steps
+
+
+def test_certifried_skips_without_creds():
+    res = authenticated.check_certifried(FakeRunner(""), ANON_TARGET)
+    assert res.skipped
+
+
+def test_phase1_and_phase2_checks_registered_in_run_all():
+    unauth_names = {
+        r.name for r in unauthenticated.run_all(
+            FakeRunner("nothing"), ANON_TARGET, timeout=60, userlist="users.txt"
+        )
+    }
+    assert "Zerologon (CVE-2020-1472)" in unauth_names
+    assert "Kerberos pre-auth username enumeration" in unauth_names
+    assert "DNS zone transfer (AXFR)" in unauth_names
+
+    auth_names = {
+        r.name for r in authenticated.run_all(FakeRunner("nothing"), AUTH_TARGET, timeout=60)
+    }
+    assert "LAPS password readability" in auth_names
+    assert "gMSA managed-password readability" in auth_names
+    assert "DnsAdmins group membership" in auth_names
+    assert "Shadow Credentials (msDS-KeyCredentialLink) write access" in auth_names
+    assert "Certifried (CVE-2022-26923) - LDAP attribute spoofing" in auth_names
 
 
 def test_nopac_detects_and_emits_dcsync_step():
@@ -233,6 +410,7 @@ def test_new_checks_registered_in_run_all():
     auth_names = {r.name for r in auth_results}
     assert "GPP cpassword in SYSVOL" in auth_names
     assert "Pre-Windows 2000 computer accounts" in auth_names
+    assert "SYSVOL / NETLOGON script credential scraping" in auth_names
     # Timeroasting is credential-free -> unauthenticated (shared) phase.
     unauth_results = unauthenticated.run_all(FakeRunner("nothing"), ANON_TARGET, timeout=60)
     unauth_names = {r.name for r in unauth_results}
@@ -473,3 +651,66 @@ def test_batch2_checks_registered_in_run_all():
     assert "Print Spooler / PrintNightmare (MS-RPRN)" in names
     assert "IPMI 2.0 RAKP hash disclosure (CVE-2013-4786)" in names
     assert "LLMNR / NBT-NS / mDNS poisoning exposure" in names
+
+
+def test_scrape_credentials_from_dir_detects_passwords():
+    """Test that _scrape_credentials_from_dir finds embedded credentials."""
+    import tempfile
+    from pathlib import Path
+
+    from domainerator.checks.authenticated import _scrape_credentials_from_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Create a script with an embedded password assignment (pattern: password[:=] or pwd[:=])
+        (root / "deploy.bat").write_text("set DB_PASSWORD=SecretPass123\n")
+
+        # Create a config file with a connection string
+        (root / "web.config").write_text(
+            '<connectionStrings><add name="db" connectionString="Server=db;User ID=sa;Password=SecretPass456"/></connectionStrings>'
+        )
+
+        # Create a file that should be ignored (wrong extension - .doc not in allowed list)
+        (root / "readme.doc").write_text("password=ignored\n")
+
+        hits = _scrape_credentials_from_dir(root)
+
+        # Should find credentials in .bat and .config files
+        assert len(hits) >= 2
+        paths = [h[0] for h in hits]
+        assert any("deploy.bat" in p for p in paths)
+        assert any("web.config" in p for p in paths)
+        # Should not find anything in .doc file (not in allowed extensions)
+        assert not any("readme.doc" in p for p in paths)
+
+
+def test_scrape_credentials_from_dir_ignores_binary_files():
+    """Test that _scrape_credentials_from_dir ignores binary files."""
+    import tempfile
+    from pathlib import Path
+
+    from domainerator.checks.authenticated import _scrape_credentials_from_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Create a binary file with a password string in it
+        (root / "binary.exe").write_bytes(b"\x00\x01password=test\x00\xff")
+
+        hits = _scrape_credentials_from_dir(root)
+
+        # .exe is not in the allowed extensions
+        assert len(hits) == 0
+
+
+def test_scrape_credentials_from_dir_empty_dir():
+    """Test that _scrape_credentials_from_dir returns empty list for empty directory."""
+    import tempfile
+    from pathlib import Path
+
+    from domainerator.checks.authenticated import _scrape_credentials_from_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hits = _scrape_credentials_from_dir(Path(tmpdir))
+        assert hits == []

@@ -86,7 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--skip-sccm", action="store_true",
                        help="Skip SCCM / PXE NAA checks.")
     scope.add_argument("--userlist",
-                       help="User list file for unauthenticated AS-REP roasting.")
+                       help="User list file for unauthenticated AS-REP roasting. "
+                            "Also used as a candidate-username wordlist for "
+                            "Kerberos pre-auth username enumeration.")
 
     bh = parser.add_argument_group("bloodhound (ACL-based paths)")
     bh.add_argument("--bloodhound", action="store_true",

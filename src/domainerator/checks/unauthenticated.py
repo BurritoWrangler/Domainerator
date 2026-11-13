@@ -10,7 +10,10 @@ These checks probe a target the way an attacker with no foothold would:
 * WebDAV / WebClient service discovery (HTTP coercion source)
 * NTLMv1 acceptance (crackable / downgradable authentication)
 * NTLM reflection exposure (coerced auth relayable back to the same host)
+* Kerberos pre-auth username enumeration (confirms a userlist without SAMR)
 * Kerberos pre-auth (AS-REP roastable accounts) when a userlist is known
+* DNS zone transfer (AXFR) for host-inventory recon
+* Zerologon (CVE-2020-1472) - unauthenticated Netlogon RCE to DCSync
 * "Big win" network footholds that often yield reusable credentials without
   any domain context: Cisco Smart Install, MS17-010 (EternalBlue), anonymous
   FTP / NFS exports, and SNMP default community strings
@@ -25,7 +28,7 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import looks_like_failure, require_tool
+from . import looks_like_failure, require_tool, skipped_result
 
 CATEGORY = "unauthenticated"
 
@@ -392,6 +395,90 @@ def check_ldap_relay_exposure(
     return result
 
 
+def check_dns_zone_transfer(
+    runner: ToolRunner, target: Target, timeout: int = 60
+) -> CheckResult:
+    """Attempt an unauthenticated DNS zone transfer (AXFR) against the domain.
+
+    An AD-integrated DNS server that permits anonymous zone transfer hands over
+    the entire zone - every A/CNAME/SRV record - revealing the full host
+    inventory, naming convention, and often hints at server roles (SQL, CA,
+    SCCM, backup) with zero authentication. Uses ``dig axfr``.
+    """
+    name = "DNS zone transfer (AXFR)"
+    skip = require_tool(runner, "dig", name, CATEGORY)
+    if skip:
+        return skip
+    if not target.domain:
+        return skipped_result(name, CATEGORY, "no domain supplied")
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = ["dig", f"@{target.host}", target.domain, "axfr"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # A successful AXFR lists records ending in the zone's SOA line a second
+    # time and a transfer size summary; a refused transfer prints
+    # "Transfer failed" / "connection refused" / "communications error".
+    records = re.findall(
+        rf"^(\S+\.{re.escape(target.domain)}\.)\s+\d+\s+IN\s+(A|CNAME|SRV)\s+(\S+)",
+        text, re.MULTILINE | re.IGNORECASE,
+    )
+    if records and not re.search(r"transfer failed|communications error", text, re.IGNORECASE):
+        hosts = sorted({r[0].rstrip(".") for r in records})
+        result.add_finding(
+            Finding(
+                title="DNS zone transfer (AXFR) succeeded",
+                severity=Severity.MEDIUM,
+                target=target.domain,
+                description=(
+                    f"The DNS server allowed an unauthenticated zone transfer, "
+                    f"disclosing {len(hosts)} host record(s) across the zone. "
+                    "This reveals the full host inventory and naming "
+                    "convention, and record names often hint at server roles "
+                    "(SQL, CA, SCCM, backup) worth prioritizing."
+                ),
+                evidence="\n".join(hosts[:40]),
+                remediation=(
+                    "Restrict zone transfers to authorized secondary DNS "
+                    "servers only (named ACL / AXFR restriction)."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="DNS zone transfer -> host inventory",
+                technique="DNS-AXFR",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.HOST_LIST,
+                command=f"dig @{target.host} {target.domain} axfr",
+                description=(
+                    "Pull the full DNS zone to enumerate hosts and infer server "
+                    "roles for targeting."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=f"{len(hosts)} host(s)",
+                source="check",
+            )
+        )
+    else:
+        if not re.search(r"transfer failed|communications error|refused|xfr size", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "dig axfr produced no recognizable transfer status (host "
+                "unreachable, not authoritative for the zone, or output "
+                "format changed)"
+            )
+    return result
+
+
 def check_asrep_roast(
     runner: ToolRunner, target: Target, userlist: str | None, timeout: int = 300
 ) -> CheckResult:
@@ -492,6 +579,117 @@ def check_asrep_roast(
                 source="check",
             )
         )
+    return result
+
+
+def check_kerberos_user_enum(
+    runner: ToolRunner, target: Target, userlist: str | None, timeout: int = 300
+) -> CheckResult:
+    """Confirm valid usernames via Kerberos pre-auth responses.
+
+    A *candidate* username wordlist is still required, but unlike AS-REP
+    roasting no domain credentials or SAMR access are needed - Kerberos itself
+    distinguishes a known principal (``KDC_ERR_PREAUTH_REQUIRED``) from an
+    unknown one (``KDC_ERR_C_PRINCIPAL_UNKNOWN``) before any credential is
+    supplied, so this works even when anonymous RID cycling is locked down.
+
+    Uses ``kerbrute userenum``. Confirmed usernames feed the USER_LIST
+    capability, the same one RID cycling produces, so AS-REP roasting and
+    password spraying become available even without anonymous SAMR access.
+    """
+    name = "Kerberos pre-auth username enumeration"
+    skip = require_tool(runner, "kerbrute", name, CATEGORY)
+    if skip:
+        return skip
+
+    if not target.domain:
+        return skipped_result(name, CATEGORY, "no domain supplied")
+    if not userlist:
+        return skipped_result(
+            name, CATEGORY,
+            "no candidate username list supplied (use --userlist to probe "
+            "candidate usernames via Kerberos pre-auth)",
+        )
+
+    result = CheckResult(name=name, category=CATEGORY)
+    dc = target.dc_ip or target.host
+    argv = ["kerbrute", "userenum", "-d", target.domain, "--dc", dc, userlist]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # kerbrute prints e.g. "[+] VALID USERNAME:       jsmith@corp.local"
+    users = re.findall(r"VALID USERNAME:\s*(\S+)", text, re.IGNORECASE)
+    if users:
+        result.add_finding(
+            Finding(
+                title="Domain usernames confirmed via Kerberos pre-auth",
+                severity=Severity.MEDIUM,
+                target=target.domain,
+                description=(
+                    f"Confirmed {len(users)} valid domain username(s) by "
+                    "observing Kerberos pre-authentication responses. This "
+                    "works even when SAMR/RID-cycling is restricted, and "
+                    "provides a userlist for AS-REP roasting and password "
+                    "spraying."
+                ),
+                evidence="\n".join(users[:30]),
+                remediation=(
+                    "This is an inherent Kerberos behavior and cannot be fully "
+                    "disabled; reduce impact with strong lockout policy, "
+                    "monitoring for AS-REQ bursts, and strong passwords."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Kerberos pre-auth enum -> userlist",
+                technique="Kerberos-user-enum",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.USER_LIST,
+                command=f"kerbrute userenum -d {target.domain} --dc {dc} users.txt",
+                description=(
+                    "Confirm valid usernames via Kerberos AS-REQ pre-auth "
+                    "responses, independent of SAMR/RID-cycling restrictions."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.MODERATE,
+                detail=f"{len(users)} confirmed",
+                source="check",
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Password spray with confirmed userlist",
+                technique="Password-spray",
+                requires=frozenset({Capability.USER_LIST}),
+                grants=Capability.VALID_CREDENTIALS,
+                command=(
+                    f"kerbrute passwordspray -d {target.domain} --dc {dc} "
+                    "users-confirmed.txt 'Season2025!'  # tune to lockout policy"
+                ),
+                description=(
+                    "Spray a likely password across confirmed users. Depends on "
+                    "weak passwords and lockout policy; run carefully."
+                ),
+                reliability=Reliability.SPECULATIVE,
+                noise=Noise.LOUD,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"no usernames confirmed but output shows '{signal}' - KDC may "
+                "be unreachable rather than the wordlist being empty of hits"
+            )
     return result
 
 
@@ -978,6 +1176,92 @@ def check_eternalblue(runner: ToolRunner, target: Target, timeout: int = 180) ->
         elif not re.search(r"ms17-010|not vulnerable", text, re.IGNORECASE):
             result.mark_inconclusive(
                 "ms17-010 module produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_zerologon(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
+    """Detect Zerologon (CVE-2020-1472) - unauthenticated Netlogon RCE.
+
+    An unauthenticated attacker on the network can abuse a cryptographic flaw
+    in the Netlogon handshake (MS-NRPC) to reset the target DC's own machine
+    account password to an empty value, then DCSync straight to Domain Admin.
+    This is one of the highest-impact unauthenticated findings possible, on
+    par with (and often more reliable than) EternalBlue. Detection only; the
+    reset itself is destructive and is left to the operator to perform
+    deliberately against an authorized target.
+    """
+    name = "Zerologon (CVE-2020-1472)"
+    skip = require_tool(runner, "nxc", name, CATEGORY)
+    if skip:
+        return skip
+
+    result = CheckResult(name=name, category=CATEGORY)
+    argv = ["nxc", "smb", target.host, "-u", "", "-p", "", "-M", "zerologon"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    vulnerable = re.search(r"vulnerable to zerologon", text, re.IGNORECASE) and not re.search(
+        r"not vulnerable to zerologon", text, re.IGNORECASE
+    )
+    if vulnerable:
+        result.add_finding(
+            Finding(
+                title="Domain Controller vulnerable to Zerologon (CVE-2020-1472)",
+                severity=Severity.CRITICAL,
+                target=target.host,
+                description=(
+                    "The DC is vulnerable to Zerologon. An unauthenticated "
+                    "attacker can reset the DC's machine account password to "
+                    "empty, then DCSync to recover krbtgt/Administrator - a "
+                    "direct route to Domain Admin with no credentials at all."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Apply the August 2020 Netlogon patches and enforce "
+                    "FullSecureChannelProtection on all DCs."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Zerologon -> reset DC password -> DCSync",
+                technique="Zerologon",
+                requires=frozenset({Capability.UNAUTHENTICATED}),
+                grants=Capability.DCSYNC,
+                command=(
+                    f"# zerologon_tester.py {target.host} {target.host}  "
+                    "# confirm, then exploit (e.g. CVE-2020-1472 PoC) to zero "
+                    "the DC machine account password, then secretsdump.py "
+                    "-just-dc -no-pass DOMAIN/MACHINE$@DC"
+                ),
+                description=(
+                    "Reset the DC's machine account password via the Netlogon "
+                    "flaw, then DCSync using the now-empty password."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.LOUD,
+                detail=target.host,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"Zerologon check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"zerologon|not vulnerable", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "zerologon module produced no recognizable output (module "
                 "unavailable or output changed)"
             )
     return result
@@ -1516,7 +1800,10 @@ def run_all(
         check_webdav(runner, target, timeout=min(timeout, 180)),
         check_ntlmv1(runner, target, timeout=min(timeout, 120)),
         check_ntlm_reflection(runner, target, timeout=min(timeout, 120)),
+        check_kerberos_user_enum(runner, target, userlist, timeout=timeout),
         check_asrep_roast(runner, target, userlist, timeout=timeout),
+        check_dns_zone_transfer(runner, target, timeout=min(timeout, 60)),
+        check_zerologon(runner, target, timeout=min(timeout, 120)),
         check_timeroast(runner, target, timeout=min(timeout, 180)),
         check_cisco_smart_install(runner, target, timeout=min(timeout, 120)),
         check_eternalblue(runner, target, timeout=min(timeout, 180)),

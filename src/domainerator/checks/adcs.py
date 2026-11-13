@@ -34,7 +34,9 @@ ESC_PATH_GRANTS: dict[str, Capability] = {
     "ESC8": Capability.CERT_AS_DA,   # relay to web enrollment -> DC cert
     "ESC9": Capability.CERT_AS_DA,   # no security ext -> cert mapping abuse
     "ESC10": Capability.CERT_AS_DA,  # weak cert mapping -> impersonation
+    "ESC12": Capability.CERT_AS_DA,  # CA private key accessible via YubiHSM admin creds
     "ESC13": Capability.CERT_AS_DA,  # issuance policy linked to privileged group
+    "ESC14": Capability.CERT_AS_DA,  # weak explicit certificate mapping (altSecurityIdentities)
     "ESC15": Capability.CERT_AS_DA,  # EKUwu / arbitrary application policies
     "ESC16": Capability.CERT_AS_DA,  # security-ext disabled CA-wide
 }
@@ -111,6 +113,14 @@ ESC_INFO: dict[str, tuple[Severity, str, str]] = {
         "CA.",
         "Enable encryption enforcement for ICertPassage RPC requests.",
     ),
+    "ESC12": (
+        Severity.HIGH,
+        "The CA's private key is accessible via a YubiHSM administrator "
+        "credential stored on the CA server, allowing the key to be exported "
+        "and used to forge certificates.",
+        "Protect YubiHSM admin credentials used by the CA, and restrict local "
+        "access to the CA server.",
+    ),
     "ESC13": (
         Severity.HIGH,
         "Template has an issuance policy linked (OID group link) to a "
@@ -133,6 +143,14 @@ ESC_INFO: dict[str, tuple[Severity, str, str]] = {
         "domain-wide.",
         "Re-enable the security extension on the CA and enforce strong "
         "certificate binding (KB5014754).",
+    ),
+    "ESC14": (
+        Severity.HIGH,
+        "A weak explicit certificate mapping (altSecurityIdentities) on a "
+        "user/computer object allows a certificate not strongly bound to "
+        "that principal to authenticate as it.",
+        "Audit and remove weak altSecurityIdentities mappings; enforce "
+        "strong certificate mapping (KB5014754).",
     ),
 }
 
@@ -281,7 +299,7 @@ def _add_esc_steps(result: CheckResult, esc: str, target: Target) -> None:
 
 def check_adcs(runner: ToolRunner, target: Target, timeout: int = 300) -> CheckResult:
     """Run Certipy find and translate its output into findings."""
-    name = "AD CS certificate template audit (ESC1-ESC11)"
+    name = "AD CS certificate template audit (ESC1-ESC16)"
 
     if not target.authenticated:
         return skipped_result(name, CATEGORY, "no credentials supplied (AD CS enumeration needs auth)")

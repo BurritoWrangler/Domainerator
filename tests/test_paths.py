@@ -200,3 +200,64 @@ def test_sccm_naa_chain_grants_credentials():
         max_depth=10,
     )
     assert got, "SCCM NAA -> valid credentials chain did not resolve"
+
+
+def test_laps_readable_chains_to_valid_credentials():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("laps-read", "LAPS-read",
+                       {Capability.LOW_PRIV_USER}, Capability.LAPS_READABLE))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.VALID_CREDENTIALS],
+        max_depth=8,
+    )
+    assert got, "LAPS readability -> valid credentials chain did not resolve"
+    assert any(s.technique == "LAPS-read" for s in got[0].steps)
+
+
+def test_gmsa_readable_chains_to_valid_credentials():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("gmsa-read", "gMSA-read",
+                       {Capability.LOW_PRIV_USER}, Capability.GMSA_READABLE))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.VALID_CREDENTIALS],
+        max_depth=8,
+    )
+    assert got, "gMSA readability -> valid credentials chain did not resolve"
+    assert any(s.technique == "gMSA-read" for s in got[0].steps)
+
+
+def test_dnsadmins_member_chains_to_local_admin():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("dnsadmins", "DnsAdmins-abuse",
+                       {Capability.LOW_PRIV_USER}, Capability.DNSADMINS_MEMBER))
+    got = eng.find_paths(
+        starting_capabilities(authenticated=True),
+        goals=[Capability.LOCAL_ADMIN],
+        max_depth=8,
+    )
+    assert got, "DnsAdmins membership -> local admin chain did not resolve"
+    assert any(s.technique == "DnsAdmins-abuse" for s in got[0].steps)
+
+
+def test_shadow_cred_writable_chains_through_cert_as_user_to_credentials():
+    eng = PathEngine()
+    eng.add_steps(baseline_steps())
+    eng.add_step(_step("shadow", "Shadow-Credentials",
+                       {Capability.LOW_PRIV_USER}, Capability.SHADOW_CRED_WRITABLE))
+    # Seed only LOW_PRIV_USER (not VALID_CREDENTIALS) so the goal can only be
+    # satisfied by actually walking Shadow-Credentials -> CERT_AS_USER ->
+    # PKINIT-auth, not because the start state already holds it.
+    got = eng.find_paths(
+        {Capability.LOW_PRIV_USER},
+        goals=[Capability.VALID_CREDENTIALS],
+        max_depth=8,
+    )
+    assert got, "Shadow Credentials -> CERT_AS_USER -> valid credentials chain did not resolve"
+    techniques = {s.technique for s in got[0].steps}
+    assert "Shadow-Credentials" in techniques
+    assert "PKINIT-auth" in techniques

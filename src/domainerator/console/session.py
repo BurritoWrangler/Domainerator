@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ..paths import AttackPath, Capability, PathEngine, PathStep
 from ..runner import CheckResult, Target, ToolRunner
 from ..state import State
 from .variables import Variables
+
+if TYPE_CHECKING:
+    from .state_machine import ExploitationStateMachine, StepStatus
 
 
 @dataclass
@@ -57,6 +61,11 @@ class Session:
     # Session metadata
     state_path: str | None = None
     modified: bool = False
+
+    # Verification and state tracking (added for console-exploitation-accuracy)
+    no_verify: bool = False  # Skip verification if True
+    _state_machine: ExploitationStateMachine | None = field(default=None, repr=False)
+    _verification_layer: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Ensure the active target is always represented in the targets list so
@@ -255,3 +264,49 @@ class Session:
             )
 
         return "\n".join(lines) if lines else "No capabilities obtained yet"
+
+
+    # === State Machine Integration ===
+
+    @property
+    def state_machine(self) -> ExploitationStateMachine:
+        """Get or create the exploitation state machine."""
+        from .state_machine import ExploitationStateMachine
+        if self._state_machine is None:
+            self._state_machine = ExploitationStateMachine(self)
+        return self._state_machine
+
+    def _build_verification_layer(self) -> object:
+        """Build the verification layer on first access."""
+        from .verification import VerificationLayer
+        if self._verification_layer is None:
+            self._verification_layer = VerificationLayer(self.runner, self)
+        return self._verification_layer
+
+    def record_step_execution(
+        self,
+        technique: str,
+        command: str,
+        status: StepStatus,
+        output: str = "",
+        capability_granted: Capability | None = None,
+    ) -> None:
+        """Record a step execution in the state machine."""
+        self.state_machine.record_step(
+            path_id=f"manual-{technique}",
+            step_index=0,
+            technique=technique,
+            status=status,
+            command=command,
+            output_summary=output[:500] if output else "",
+            capability_granted=capability_granted,
+        )
+        self.modified = True
+
+    def get_execution_summary(self) -> dict:
+        """Get summary of step execution history."""
+        return self.state_machine.get_status_summary()
+
+    def get_orphaned_capabilities(self) -> list:
+        """Find manually granted capabilities without step provenance."""
+        return self.state_machine.get_orphaned_capabilities()

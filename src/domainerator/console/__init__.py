@@ -2,5 +2,14 @@
 
 from .console import Console
 from .session import Session
+from .state_machine import ExploitationStateMachine, StepStatus
+from .verification import VerificationLayer, VerificationStatus
 
-__all__ = ["Session", "Console"]
+__all__ = [
+    "Session",
+    "Console",
+    "ExploitationStateMachine",
+    "StepStatus",
+    "VerificationLayer",
+    "VerificationStatus",
+]

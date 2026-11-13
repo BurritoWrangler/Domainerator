@@ -20,10 +20,13 @@ It runs in two modes:
 - **Unauthenticated** — given just a target (and optionally a domain), it probes SMB
   signing, NULL sessions, anonymous share/RID enumeration, LDAP anonymous bind, LDAP
   signing / channel-binding relay exposure, WebDAV/WebClient discovery, **timeroasting**
-  (NTP computer-account hashes, no creds required), AS-REP roasting (with a userlist), and
-  "big win" network footholds — **Cisco Smart Install**, **MS17-010 (EternalBlue)**,
-  **anonymous FTP / NFS exports**, and **SNMP default community** strings — that often
-  yield reusable credentials with no domain context.
+  (NTP computer-account hashes, no creds required), **Kerberos pre-auth username
+  enumeration** (confirms a userlist without needing SAMR access), AS-REP roasting (with a
+  userlist), a **DNS zone transfer (AXFR)** recon check, **Zerologon** (CVE-2020-1472 —
+  unauthenticated Netlogon RCE straight to DCSync), and "big win" network footholds —
+  **Cisco Smart Install**, **MS17-010 (EternalBlue)**, **anonymous FTP / NFS exports**, and
+  **SNMP default community** strings — that often yield reusable credentials with no
+  domain context.
 - **Authenticated** — given a domain, username, and password (or NT hash), it adds
   password-policy review, local-admin detection, Kerberoasting, delegation
   enumeration, active **RBCD enumeration**, **coercion-surface detection**
@@ -63,6 +66,23 @@ signing / channel binding — together these form the classic HTTP-coercion → 
 - **SCCM / PXE NAA** — discovers SCCM management points / sites in AD and probes
   PXE-enabled distribution points for recoverable **Network Access Account** credentials,
   which are valid domain credentials and a useful foothold.
+
+### Zerologon, Kerberos user enumeration, and DNS zone transfer
+
+- **Zerologon (CVE-2020-1472)** — an unauthenticated flaw in the Netlogon handshake lets
+  an attacker reset the DC's own machine account password to empty, then DCSync straight
+  to Domain Admin. One of the highest-impact unauthenticated findings possible
+  (`unauthenticated` → `dcsync` → Domain Admin). Detection only — the reset itself is
+  destructive and left to the operator to run deliberately.
+- **Kerberos pre-auth username enumeration** — Kerberos itself distinguishes a known
+  principal from an unknown one before any credential is supplied
+  (`KDC_ERR_PREAUTH_REQUIRED` vs. `KDC_ERR_C_PRINCIPAL_UNKNOWN`). Given a candidate
+  username wordlist (`--userlist`), this confirms real accounts even when anonymous RID
+  cycling is locked down, feeding the same userlist AS-REP roasting and password spraying
+  use (`unauthenticated` → `user_list`).
+- **DNS zone transfer (AXFR)** — an AD-integrated DNS server that allows anonymous zone
+  transfer hands over the full host inventory with zero authentication, often hinting at
+  server roles (SQL, CA, SCCM, backup) worth prioritizing (`unauthenticated` → `host_list`).
 
 ### Credential-recovery footholds: GPP, pre-2000, timeroasting
 
@@ -498,6 +518,8 @@ Install the tools it drives:
 | `coercer` | Coercion trigger for `relay` orchestration | `pipx install coercer` |
 | `PetitPotam.py` / `printerbug.py` / `dfscoerce.py` | Alternative coercion triggers | project scripts on PATH |
 | `nmap` | Cisco Smart Install / FTP / NFS / SNMP foothold checks | `sudo apt install nmap` |
+| `kerbrute` | Kerberos pre-auth username enumeration | `pipx install kerbrute` or [project releases](https://github.com/ropnop/kerbrute) |
+| `dig` | DNS zone transfer (AXFR) recon | `sudo apt install dnsutils` (usually preinstalled on Kali) |
 
 A missing tool never aborts the run — the checks that need it are reported as
 **skipped** with an install hint.

@@ -9,13 +9,13 @@ from domainerator.runner import CheckResult, Target
 
 def test_esc_map_covers_esc1_to_esc16():
     # The extended set must be present in the path-grant map.
-    for esc in ("ESC1", "ESC8", "ESC9", "ESC10", "ESC13", "ESC15", "ESC16"):
+    for esc in ("ESC1", "ESC8", "ESC9", "ESC10", "ESC12", "ESC13", "ESC14", "ESC15", "ESC16"):
         assert esc in adcs.ESC_PATH_GRANTS
         assert adcs.ESC_PATH_GRANTS[esc] == Capability.CERT_AS_DA
 
 
 def test_new_esc_ids_have_info():
-    for esc in ("ESC13", "ESC15", "ESC16"):
+    for esc in ("ESC12", "ESC13", "ESC14", "ESC15", "ESC16"):
         assert esc in adcs.ESC_INFO
 
 

@@ -10,6 +10,10 @@ With a valid domain account we can inspect the directory in far more depth:
 * Resource-based constrained delegation (RBCD) enumeration
 * MachineAccountQuota (adds risk for several privilege-escalation paths)
 * LDAP signing / channel binding posture
+* LAPS / gMSA managed-password readability
+* DnsAdmins group membership (DLL-load-as-SYSTEM on the DC's DNS service)
+* Shadow Credentials (msDS-KeyCredentialLink) write access
+* Certifried (CVE-2022-26923) exposure
 
 Every check is a no-op that returns a *skipped* CheckResult when the required
 tool is missing or when no credentials are available.
@@ -769,6 +773,576 @@ def check_pre2k_computers(runner: ToolRunner, target: Target, timeout: int = 180
     return result
 
 
+def check_laps_readability(
+    runner: ToolRunner, target: Target, timeout: int = 180
+) -> CheckResult:
+    """Report which principals can currently read LAPS passwords.
+
+    This is deliberately independent of a BloodHound collection: a direct
+    ``nxc ldap -M laps`` sweep reports local-admin passwords the *supplied*
+    account can read right now, which is useful even without a graph and also
+    surfaces the legacy, cleartext-adjacent ``ms-Mcs-AdmPwd`` attribute
+    (pre-Windows LAPS) distinctly from the newer encrypted LAPS v2 attribute.
+    """
+    name = "LAPS password readability"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = ["nxc", "ldap", target.host, *target.nxc_auth_args(), "-M", "laps"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # The laps module prints recovered "Host: ... Password: ..." pairs.
+    hosts = re.findall(r"([A-Za-z0-9._-]+\$?)\s*[:\-]\s*Password", text, re.IGNORECASE)
+    if hosts or re.search(r"ms-?mcs-?admpwd|laps.*password", text, re.IGNORECASE):
+        names = ", ".join(sorted(set(hosts)))[:200]
+        result.add_finding(
+            Finding(
+                title="LAPS password(s) readable with supplied account",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    "The supplied account can read one or more LAPS-managed "
+                    "local administrator passwords, a direct local-admin "
+                    "credential on each affected host."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Restrict the 'LAPS Password Readers' / "
+                    "ms-Mcs-AdmPwd(V2) read ACL to only the groups that need "
+                    "it, and audit membership regularly."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Read LAPS password",
+                technique="LAPS-read",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.LAPS_READABLE,
+                command=f"nxc ldap {target.host} -u USER -p PASS -M laps",
+                description="Read a LAPS-managed local administrator password.",
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=names,
+                source="check",
+            )
+        )
+    return result
+
+
+def check_gmsa_readability(
+    runner: ToolRunner, target: Target, timeout: int = 180
+) -> CheckResult:
+    """Report group-managed service account (gMSA) passwords readable by us.
+
+    Complements BloodHound's ReadGMSAPassword edge with a direct check: any
+    principal that can read ``msDS-ManagedPassword`` on a gMSA can decode it
+    to that account's current NTLM hash immediately.
+    """
+    name = "gMSA managed-password readability"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = ["nxc", "ldap", target.host, *target.nxc_auth_args(), "--gmsa"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    # nxc's --gmsa prints "Account: NAME$    NTLM: <hash>" for each readable gMSA.
+    accounts = re.findall(r"Account:\s*(\S+)\s+NTLM:\s*([0-9a-fA-F]{32})", text)
+    if accounts:
+        names = ", ".join(sorted({a for a, _ in accounts}))[:200]
+        result.add_finding(
+            Finding(
+                title="gMSA managed password(s) readable and decoded",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    f"{len(accounts)} group-managed service account "
+                    "password(s) were decoded to a usable NTLM hash via "
+                    "readable msDS-ManagedPassword."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Restrict the gMSA's PrincipalsAllowedToRetrieveManagedPassword "
+                    "to only the hosts/services that need it."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Read gMSA managed password",
+                technique="gMSA-read",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.GMSA_READABLE,
+                command=f"nxc ldap {target.host} -u USER -p PASS --gmsa",
+                description=(
+                    "Decode a readable gMSA's msDS-ManagedPassword to its "
+                    "current NTLM hash."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=names,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(f"gMSA check inconclusive; output shows '{signal}'")
+        elif not re.search(r"gmsa|managedpassword|no.*gmsa", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "--gmsa produced no recognizable output (no gMSAs present, "
+                "module unavailable, or output changed)"
+            )
+    return result
+
+
+def check_dnsadmins_membership(
+    runner: ToolRunner, target: Target, timeout: int = 180
+) -> CheckResult:
+    """Detect membership in DnsAdmins - a classic DLL-load-as-SYSTEM path.
+
+    A member of DnsAdmins can set ``dnscmd /config /serverlevelplugindll`` to
+    an attacker-controlled DLL, which the DNS service (frequently running as
+    SYSTEM on a DC) loads. This is checked directly via LDAP group membership
+    rather than requiring a BloodHound collection.
+    """
+    name = "DnsAdmins group membership"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = [
+        "nxc", "ldap", target.host, *target.nxc_auth_args(),
+        "--query", "(&(objectClass=group)(cn=DnsAdmins))", "member",
+    ]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    members = re.findall(r"CN=([^,]+),", text)
+    if members:
+        names = ", ".join(sorted(set(members)))[:200]
+        result.add_finding(
+            Finding(
+                title="DnsAdmins group has members",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    f"DnsAdmins has {len(set(members))} member(s): {names}. Any "
+                    "member can configure the DNS service to load an arbitrary "
+                    "DLL, typically yielding SYSTEM on the DC running DNS."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Limit DnsAdmins membership to Domain Admins only, and "
+                    "restrict who can modify dnscmd server-level plugin "
+                    "settings."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="DnsAdmins member -> DLL load as SYSTEM",
+                technique="DnsAdmins-abuse",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.DNSADMINS_MEMBER,
+                command=(
+                    f"nxc ldap {target.host} -u USER -p PASS --query "
+                    "'(cn=DnsAdmins)' member"
+                ),
+                description="Confirmed membership in DnsAdmins.",
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                detail=names,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"DnsAdmins query inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"dnsadmins|member", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "DnsAdmins query produced no recognizable output (query "
+                "unsupported or output changed)"
+            )
+    return result
+
+
+def check_shadow_credentials_writable(
+    runner: ToolRunner, target: Target, timeout: int = 180
+) -> CheckResult:
+    """Check whether the supplied account can write its own Shadow Credentials.
+
+    Some environments leave the default "Validated write to
+    msDS-KeyCredentialLink" self-right enabled, letting any authenticated
+    user add a key credential to their *own* account and authenticate as
+    themselves via PKINIT - not a privilege escalation on its own, but this
+    check exists to catch the broader case where self-write (or write on
+    another principal) is enabled, complementing BloodHound's
+    AddKeyCredentialLink ACL edges for environments where no graph was
+    collected or it is stale.
+    """
+    name = "Shadow Credentials (msDS-KeyCredentialLink) write access"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = [
+        "certipy", "shadow", "auto",
+        "-u", f"{target.username}@{target.domain}" if target.domain else (target.username or ""),
+        "-account", target.username or "",
+    ]
+    if target.nthash:
+        argv += ["-hashes", target.nthash]
+    elif target.password:
+        argv += ["-p", target.password]
+    if target.dc_ip:
+        argv += ["-dc-ip", target.dc_ip]
+    skip = require_tool(runner, "certipy", name, CATEGORY)
+    if skip:
+        alt = require_tool(runner, "certipy-ad", name, CATEGORY)
+        if alt:
+            return alt
+        argv[0] = "certipy-ad"
+
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    text = out.combined
+    if re.search(r"Updated the.*msDS-KeyCredentialLink|Generating certificate|Saved PFX", text, re.IGNORECASE):
+        result.add_finding(
+            Finding(
+                title="Shadow Credentials write succeeded",
+                severity=Severity.MEDIUM,
+                target=target.username or target.host,
+                description=(
+                    "The supplied account could add a Shadow Credential "
+                    "(msDS-KeyCredentialLink) to its own object. Where this "
+                    "same write right extends to other principals (owned or "
+                    "DACL-controlled), it enables impersonating them via "
+                    "PKINIT without knowing/resetting their password."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Review and restrict write access to msDS-KeyCredentialLink; "
+                    "it should not be broadly self-writable in hardened "
+                    "environments."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Shadow Credentials write confirmed",
+                technique="Shadow-Credentials",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.SHADOW_CRED_WRITABLE,
+                command=(
+                    "certipy shadow auto -u USER@DOMAIN -p PASS -account TARGET "
+                    "-dc-ip DC-IP"
+                ),
+                description=(
+                    "Confirmed msDS-KeyCredentialLink is writable; combine with "
+                    "DACL control over another principal to impersonate them."
+                ),
+                reliability=Reliability.HIGH,
+                noise=Noise.QUIET,
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(text)
+        if signal:
+            result.mark_inconclusive(
+                f"Shadow Credentials check inconclusive; output shows '{signal}'"
+            )
+        elif not re.search(r"keycredentiallink|shadow", text, re.IGNORECASE):
+            result.mark_inconclusive(
+                "certipy shadow produced no recognizable output (module "
+                "unavailable or output changed)"
+            )
+    return result
+
+
+def check_certifried(runner: ToolRunner, target: Target, timeout: int = 180) -> CheckResult:
+    """Detect Certifried (CVE-2022-26923) exposure - LDAP attribute spoofing
+    on a self-created machine account.
+
+    Distinct from noPac (a Kerberos PAC/ticket bug, patched separately):
+    Certifried is an LDAP write bug where an account that owns a computer
+    object it created (via MachineAccountQuota) can rewrite that object's
+    ``dNSHostName``/``sAMAccountName`` to spoof a more privileged computer
+    (such as the DC itself) before requesting a certificate, yielding a
+    certificate that authenticates as the spoofed principal. The vulnerable
+    condition is simply "MachineAccountQuota > 0 and the May 2022 AD updates
+    are not confirmed installed" - this check reuses the MAQ read already
+    performed by :func:`check_machine_account_quota` to flag the risk rather
+    than duplicating the LDAP query, and never performs the (destructive)
+    rename itself.
+    """
+    name = "Certifried (CVE-2022-26923) - LDAP attribute spoofing"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+    argv = ["nxc", "ldap", target.host, *target.nxc_auth_args(), "-M", "maq"]
+    out = runner.run(argv, timeout=timeout)
+    result.command = out.command
+    result.raw_output = out.combined
+    result.return_code = out.return_code
+    result.duration_seconds = out.duration_seconds
+    if out.error:
+        result.error = out.error
+        return result
+
+    m = re.search(r"MachineAccountQuota:\s*(\d+)", out.combined)
+    if m and int(m.group(1)) > 0:
+        result.add_finding(
+            Finding(
+                title="Certifried (CVE-2022-26923) precondition present",
+                severity=Severity.CRITICAL,
+                target=target.domain or target.host,
+                description=(
+                    f"MachineAccountQuota is {m.group(1)}, so the account can "
+                    "create a computer object. If the May 2022 Active "
+                    "Directory updates are not installed, an attacker can "
+                    "rename a self-created computer object's dNSHostName to "
+                    "spoof the DC, request a certificate as it, and "
+                    "authenticate as the DC via PKINIT - a direct route to "
+                    "DCSync / Domain Admin."
+                ),
+                evidence=m.group(0),
+                remediation=(
+                    "Apply the May 2022 Active Directory updates "
+                    "(CVE-2022-26923) on all DCs, and set "
+                    "ms-DS-MachineAccountQuota to 0."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Certifried: spoof DC via owned machine account",
+                technique="Certifried",
+                requires=frozenset({Capability.MACHINE_ACCOUNT}),
+                grants=Capability.CERT_AS_DA,
+                command=(
+                    "certipy account update -u USER@DOMAIN -p PASS "
+                    "-user 'PWN$' -dns 'DC-NAME'  &&  "
+                    "certipy req -u 'PWN$@DOMAIN' -p 'Passw0rd!' -ca CA-NAME "
+                    "-template Machine -dc-ip DC-IP"
+                ),
+                description=(
+                    "Rename a self-created machine account's dNSHostName to "
+                    "the DC's name, then request a Machine-template "
+                    "certificate that authenticates as the DC."
+                ),
+                reliability=Reliability.MODERATE,
+                noise=Noise.MODERATE,
+                detail="unpatched (May 2022) DC required",
+                source="check",
+            )
+        )
+    return result
+
+
+# File extensions worth scraping for embedded credentials: deployment/config
+# files and scripts that routinely carry them, beyond the GPP XML already
+# covered by check_gpp_cpassword.
+_SCRAPE_EXTS = (
+    "xml", "config", "ini", "vbs", "ps1", "bat", "cmd", "txt", "inf",
+)
+
+# Patterns that indicate an embedded credential in script/config content.
+# Conservative and line-oriented so ordinary text is not mistaken for a find.
+_CRED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # unattend.xml / sysprep answer files: <Password><Value>...</Value></Password>
+    re.compile(
+        r"<Password>\s*<Value>([^<]+)</Value>.*?</Password>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # web.config connection strings: User ID=x;Password=y / uid=x;pwd=y
+    re.compile(
+        r"(?:User ID|uid)\s*=\s*([^;]+);\s*(?:Password|pwd)\s*=\s*([^;\"']+)",
+        re.IGNORECASE,
+    ),
+    # scripts: net use / psexec-style embedded creds, or a plain assignment.
+    re.compile(
+        r"(?:password|pwd|pass)\s*[:=]\s*[\"']?([^\s\"'<>]{4,})",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _scrape_credentials_from_dir(root) -> list[tuple[str, str]]:
+    """Walk a downloaded-share directory and return (relative path, match)
+    pairs for files whose content matches a known credential pattern.
+
+    Kept as a small, isolated helper (rather than inline in the check) so it
+    can be unit-tested directly against a tmp_path fixture without needing
+    nxc/spider_plus installed.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(root)
+    hits: list[tuple[str, str]] = []
+    if not root.exists():
+        return hits
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lstrip(".").lower() not in _SCRAPE_EXTS:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for pattern in _CRED_PATTERNS:
+            for m in pattern.finditer(text):
+                snippet = m.group(0).strip()[:200]
+                try:
+                    rel = str(path.relative_to(root))
+                except ValueError:
+                    rel = str(path)
+                hits.append((rel, snippet))
+    return hits
+
+
+def check_sysvol_script_credentials(
+    runner: ToolRunner, target: Target, timeout: int = 300
+) -> CheckResult:
+    """Scrape SYSVOL/NETLOGON content beyond GPP XML for embedded credentials.
+
+    GPP cpassword (see :func:`check_gpp_cpassword`) only covers the specific,
+    publicly-decryptable XML attribute. Deployment scripts, answer files
+    (``unattend.xml``), and config files (``web.config``) left on SYSVOL or
+    NETLOGON routinely carry plaintext credentials by other means - a
+    hardcoded ``net use`` password, a sysprep ``<Password>`` block, or a
+    connection-string ``Password=``. This downloads share content via
+    NetExec's ``spider_plus`` module (download-and-report; it does not match
+    content itself) into a temporary folder, then scans the downloaded files
+    for those patterns.
+    """
+    name = "SYSVOL / NETLOGON script credential scraping"
+    guard = _guard(runner, target, name)
+    if guard:
+        return guard
+
+    result = _base_result(name)
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="domainerator-spider-") as tmpdir:
+        argv = [
+            "nxc", "smb", target.host, *target.nxc_auth_args(),
+            "-M", "spider_plus", "-o", "DOWNLOAD_FLAG=True",
+            f"OUTPUT_FOLDER={tmpdir}",
+        ]
+        out = runner.run(argv, timeout=timeout)
+        result.command = out.command
+        result.raw_output = out.combined
+        result.return_code = out.return_code
+        result.duration_seconds = out.duration_seconds
+        if out.error:
+            result.error = out.error
+            return result
+
+        if runner.dry_run:
+            # Nothing was actually downloaded in dry-run; nothing to scrape.
+            return result
+
+        hits = _scrape_credentials_from_dir(tmpdir)
+
+    if hits:
+        evidence_lines = [f"{path}: {snippet}" for path, snippet in hits[:20]]
+        result.raw_output += "\n\n--- credential scrape matches ---\n" + "\n".join(
+            evidence_lines
+        )
+        result.add_finding(
+            Finding(
+                title="Embedded credentials found in SYSVOL/NETLOGON content",
+                severity=Severity.HIGH,
+                target=target.domain or target.host,
+                description=(
+                    f"{len(hits)} embedded credential-shaped string(s) were "
+                    "found in SYSVOL/NETLOGON scripts or config files "
+                    "(deployment scripts, unattend.xml, web.config, etc.), "
+                    "distinct from the GPP cpassword attribute."
+                ),
+                evidence="\n".join(evidence_lines),
+                remediation=(
+                    "Remove hardcoded credentials from scripts and config "
+                    "files on SYSVOL/NETLOGON; use gMSA or a secrets vault "
+                    "instead, and rotate any exposed passwords."
+                ),
+            )
+        )
+        result.add_step(
+            PathStep(
+                name="Scrape SYSVOL/NETLOGON scripts -> credentials",
+                technique="SYSVOL-script-creds",
+                requires=frozenset({Capability.LOW_PRIV_USER}),
+                grants=Capability.VALID_CREDENTIALS,
+                command=(
+                    f"nxc smb {target.host} -u USER -p PASS -M spider_plus "
+                    "-o DOWNLOAD_FLAG=True OUTPUT_FOLDER=./sysvol-dump  "
+                    "# then grep -ri password ./sysvol-dump"
+                ),
+                description=(
+                    "Download SYSVOL/NETLOGON content and grep scripts/config "
+                    "files for hardcoded credentials."
+                ),
+                reliability=Reliability.SPECULATIVE,
+                noise=Noise.QUIET,
+                detail=f"{len(hits)} match(es)",
+                source="check",
+            )
+        )
+    else:
+        signal = looks_like_failure(out.combined)
+        if signal:
+            result.mark_inconclusive(
+                f"spider_plus download inconclusive; output shows '{signal}'"
+            )
+    return result
+
+
 def _mark_inconclusive_on_failure(results: list[CheckResult]) -> list[CheckResult]:
     """Post-process: a ran-but-empty check whose output shows a connection or
     auth failure is inconclusive, not clean.
@@ -801,6 +1375,12 @@ def run_all(runner: ToolRunner, target: Target, timeout: int = 300) -> list[Chec
         check_coercion(runner, target, timeout=min(timeout, 180)),
         check_nopac(runner, target, timeout=min(timeout, 180)),
         check_gpp_cpassword(runner, target, timeout=min(timeout, 180)),
+        check_sysvol_script_credentials(runner, target, timeout=min(timeout, 300)),
         check_pre2k_computers(runner, target, timeout=min(timeout, 180)),
+        check_laps_readability(runner, target, timeout=min(timeout, 180)),
+        check_gmsa_readability(runner, target, timeout=min(timeout, 180)),
+        check_dnsadmins_membership(runner, target, timeout=min(timeout, 180)),
+        check_shadow_credentials_writable(runner, target, timeout=min(timeout, 180)),
+        check_certifried(runner, target, timeout=min(timeout, 180)),
     ]
     return _mark_inconclusive_on_failure(results)

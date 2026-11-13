@@ -56,6 +56,7 @@ class Console:
             "info": self.cmd_info,
             "run": self.cmd_run,
             "exploit": self.cmd_run,
+            "autoexploit": self.cmd_autoexploit,
             "autorun": self.cmd_autorun,
             "preview": self.cmd_preview,
             "next": self.cmd_next,
@@ -64,6 +65,7 @@ class Console:
             "unset": self.cmd_unset,
             "options": self.cmd_options,
             "grant": self.cmd_grant,
+            "verify": self.cmd_verify,
             "loot": self.cmd_loot,
             "targets": self.cmd_targets,
             "target": self.cmd_target,
@@ -221,6 +223,7 @@ class Console:
         print("  preview              Show the current step's fully-substituted command")
         print("  run, exploit         Execute/guide through the current step")
         print("  autorun              Auto-walk the whole path; pause only when you're needed")
+        print("  autoexploit <goal>   One-shot exploitation to a goal (da, dcsync, ea)")
         print("  next                 Advance to next step in path")
         print("  back                 Deselect current path, return to main menu")
         print()
@@ -231,6 +234,7 @@ class Console:
         print()
         print("Capabilities:")
         print("  grant <capability>   Manually mark a capability as obtained")
+        print("  verify [id]          Verify findings are exploitable")
         print()
         print("Loot:")
         print("  loot                 List captured credentials/hashes (same as 'show loot')")
@@ -1416,6 +1420,74 @@ class Console:
 
         print(f"Report written:\n  {md_path}\n  {js_path}")
 
+    def cmd_autoexploit(self, args: list[str]) -> None:
+        """Execute automated exploitation toward a goal."""
+        from .exploit import ExploitCommand
+
+        if not args:
+            print("Usage: autoexploit <goal> [--preview] [--dry-run]")
+            print("Goals: da, dcsync, ea, local-admin, rbcd, valid-credentials")
+            print()
+            print("Options:")
+            print("  --preview   Show the execution plan without running")
+            print("  --dry-run   Show commands without executing")
+            return
+
+        goal_str = args[0]
+        preview = "--preview" in args
+        dry_run = "--dry-run" in args
+
+        exploit = ExploitCommand(self.session, self)
+        result = exploit.execute(goal_str, preview=preview, dry_run=dry_run)
+
+        print()
+        print(exploit.format_result(result))
+
+        # If successful, update session capabilities
+        if result.succeeded:
+            self.session.capabilities.update(result.capabilities_gained)
+            self.session.modified = True
+
+    def cmd_verify(self, args: list[str]) -> None:
+        """Verify findings are exploitable."""
+        # Handle refresh option
+        if args and args[0] == "--refresh":
+            if len(args) > 1:
+                # Refresh specific finding
+                finding_id = args[1]
+                print(f"Refreshing verification for finding: {finding_id}")
+                count = self.session._build_verification_layer().invalidate(finding_id)
+                print(f"Invalidated {count} cache entries.")
+            else:
+                # Refresh all
+                print("Refreshing all verification caches...")
+                count = self.session._build_verification_layer().invalidate()
+                print(f"Invalidated {count} cache entries.")
+            return
+
+        # List findings that can be verified
+        print()
+        print("Verification Status:")
+        print("-" * 60)
+
+        # Collect all findings
+        findings = []
+        for result in self.session.check_results:
+            for finding in result.findings:
+                findings.append(finding)
+
+        if not findings:
+            print("No findings to verify.")
+            return
+
+        for i, finding in enumerate(findings, 1):
+            status_str = "pending"
+            print(f"  [{i}] {finding.title[:50]} - {status_str}")
+
+        print()
+        print("Use 'verify <id>' to verify a specific finding.")
+        print("Use 'verify --refresh' to invalidate all caches.")
+
     def cmd_status(self, args: list[str]) -> None:
         """Show session status."""
         print()
@@ -1424,6 +1496,14 @@ class Console:
         print(f"  Checks run: {len(self.session.check_results)}")
         print(f"  Capabilities: {len(self.session.capabilities)}")
         print(f"  Attack paths: {len(self.session.attack_paths)}")
+
+        # Add state machine summary
+        summary = self.session.get_execution_summary()
+        print(f"  Steps executed: {summary['total_steps']}")
+        print(f"  Success rate: {summary['success_rate']}%")
+        if summary['orphaned_capabilities'] > 0:
+            print(f"  Orphaned capabilities: {summary['orphaned_capabilities']} (use 'grant' to track)")
+
         if self.session.state_path:
             print(f"  State file: {self.session.state_path}")
         print(f"  Modified: {self.session.modified}")
