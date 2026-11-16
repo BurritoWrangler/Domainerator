@@ -146,10 +146,9 @@ def check_null_session(runner: ToolRunner, target: Target, timeout: int = 120) -
         return result
 
     text = out.combined
-    # If shares are listed under a null session that's notable.
-    if re.search(r"\bREAD\b|\bWRITE\b", text) and "shares" not in text.lower()[:0]:
-        # Heuristic: presence of READ/WRITE permission tokens implies shares
-        # were enumerated anonymously.
+    # If shares are listed under a null session that's notable. Presence of
+    # READ/WRITE permission tokens implies shares were enumerated anonymously.
+    if re.search(r"\bREAD\b|\bWRITE\b", text):
         readable = re.findall(r"^\s*(\S+)\s+READ", text, re.MULTILINE)
         result.add_finding(
             Finding(
