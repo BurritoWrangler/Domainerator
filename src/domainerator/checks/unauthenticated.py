@@ -28,9 +28,24 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import looks_like_failure, require_tool, skipped_result
+from . import FailureKind, classify_failure, looks_like_failure, require_tool, skipped_result
 
 CATEGORY = "unauthenticated"
+
+
+def _access_denied_finding(title: str, what: str, target: Target, evidence: str) -> Finding:
+    """INFO finding for a probe the target answered and refused (a hardening signal)."""
+    return Finding(
+        title=title,
+        severity=Severity.INFO,
+        target=target.host,
+        description=(
+            f"The target answered and refused {what} (access denied). This shows "
+            "the access is restricted; it is not a connectivity failure."
+        ),
+        evidence=evidence[:500],
+        remediation="No action required; anonymous access is already restricted.",
+    )
 
 
 def check_smb_signing(runner: ToolRunner, target: Target, timeout: int = 120) -> CheckResult:
@@ -167,11 +182,17 @@ def check_null_session(runner: ToolRunner, target: Target, timeout: int = 120) -
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
+            result.add_finding(
+                _access_denied_finding(
+                    "Anonymous SMB session refused", "the NULL SMB session", target, text
+                )
+            )
+        elif classified:
             result.mark_inconclusive(
-                f"no shares enumerated but output shows '{signal}' - NULL session "
-                "may have been refused rather than truly restricted"
+                f"no shares enumerated but output shows '{classified[1]}' - NULL "
+                "session may have been refused rather than truly restricted"
             )
     return result
 
@@ -254,10 +275,16 @@ def check_rid_cycling(runner: ToolRunner, target: Target, timeout: int = 180) ->
             )
         )
     else:
-        signal = looks_like_failure(out.combined)
-        if signal:
+        classified = classify_failure(out.combined)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
+            result.add_finding(
+                _access_denied_finding(
+                    "Anonymous RID cycling refused", "anonymous RID cycling", target, out.combined
+                )
+            )
+        elif classified:
             result.mark_inconclusive(
-                f"no users enumerated but output shows '{signal}' - RID cycling "
+                f"no users enumerated but output shows '{classified[1]}' - RID cycling "
                 "may have been blocked rather than unavailable"
             )
     return result
@@ -302,10 +329,16 @@ def check_ldap_anonymous_bind(
             )
         )
     else:
-        signal = looks_like_failure(out.combined)
-        if signal:
+        classified = classify_failure(out.combined)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
+            result.add_finding(
+                _access_denied_finding(
+                    "Anonymous LDAP bind refused", "the anonymous LDAP bind", target, out.combined
+                )
+            )
+        elif classified:
             result.mark_inconclusive(
-                f"anonymous bind not confirmed and output shows '{signal}'"
+                f"anonymous bind not confirmed and output shows '{classified[1]}'"
             )
     return result
 
@@ -1005,10 +1038,15 @@ def check_timeroast(runner: ToolRunner, target: Target, timeout: int = 180) -> C
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
             result.mark_inconclusive(
-                f"timeroast inconclusive; output shows '{signal}'"
+                f"timeroast inconclusive; the login was refused (output shows "
+                f"'{classified[1]}') before the module could run"
+            )
+        elif classified:
+            result.mark_inconclusive(
+                f"timeroast inconclusive; output shows '{classified[1]}'"
             )
         elif not re.search(r"timeroast|sntp|ntp|no.*hash", text, re.IGNORECASE):
             result.mark_inconclusive(
@@ -1167,10 +1205,16 @@ def check_eternalblue(runner: ToolRunner, target: Target, timeout: int = 180) ->
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
             result.mark_inconclusive(
-                f"MS17-010 check inconclusive; output shows '{signal}'"
+                f"MS17-010 check inconclusive; the null-session login was "
+                f"refused (output shows '{classified[1]}') and the module did "
+                "not run"
+            )
+        elif classified:
+            result.mark_inconclusive(
+                f"MS17-010 check inconclusive; output shows '{classified[1]}'"
             )
         elif not re.search(r"ms17-010|not vulnerable", text, re.IGNORECASE):
             result.mark_inconclusive(
@@ -1253,10 +1297,16 @@ def check_zerologon(runner: ToolRunner, target: Target, timeout: int = 120) -> C
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
             result.mark_inconclusive(
-                f"Zerologon check inconclusive; output shows '{signal}'"
+                f"Zerologon check inconclusive; the null-session login was "
+                f"refused (output shows '{classified[1]}') and the module did "
+                "not run"
+            )
+        elif classified:
+            result.mark_inconclusive(
+                f"Zerologon check inconclusive; output shows '{classified[1]}'"
             )
         elif not re.search(r"zerologon|not vulnerable", text, re.IGNORECASE):
             result.mark_inconclusive(
@@ -1519,10 +1569,16 @@ def check_smbghost(runner: ToolRunner, target: Target, timeout: int = 120) -> Ch
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
             result.mark_inconclusive(
-                f"SMBGhost check inconclusive; output shows '{signal}'"
+                f"SMBGhost check inconclusive; the null-session login was "
+                f"refused (output shows '{classified[1]}') and the module did "
+                "not run"
+            )
+        elif classified:
+            result.mark_inconclusive(
+                f"SMBGhost check inconclusive; output shows '{classified[1]}'"
             )
         elif not re.search(r"smbghost|cve-2020-0796|not vulnerable", text, re.IGNORECASE):
             result.mark_inconclusive(
@@ -1602,10 +1658,16 @@ def check_printnightmare(runner: ToolRunner, target: Target, timeout: int = 120)
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
             result.mark_inconclusive(
-                f"spooler check inconclusive; output shows '{signal}'"
+                f"spooler check inconclusive; the null-session login was "
+                f"refused (output shows '{classified[1]}') and the module did "
+                "not run"
+            )
+        elif classified:
+            result.mark_inconclusive(
+                f"spooler check inconclusive; output shows '{classified[1]}'"
             )
         elif not re.search(r"spooler|printnightmare|rprn", text, re.IGNORECASE):
             result.mark_inconclusive(

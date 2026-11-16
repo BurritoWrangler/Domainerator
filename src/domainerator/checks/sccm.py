@@ -27,7 +27,7 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import looks_like_failure, require_tool, skipped_result
+from . import FailureKind, classify_failure, looks_like_failure, require_tool, skipped_result
 
 CATEGORY = "sccm"
 
@@ -206,9 +206,14 @@ def check_sccm_pxe_naa(
             )
         )
     else:
-        signal = looks_like_failure(text)
-        if signal:
-            result.mark_inconclusive(f"PXE probe inconclusive; output shows '{signal}'")
+        classified = classify_failure(text)
+        if classified and classified[0] is FailureKind.ACCESS_DENIED:
+            result.mark_inconclusive(
+                f"PXE probe inconclusive; the login was refused (output shows "
+                f"'{classified[1]}') and the module did not run"
+            )
+        elif classified:
+            result.mark_inconclusive(f"PXE probe inconclusive; output shows '{classified[1]}'")
         elif not re.search(r"pxe|sccm|naa", text, re.IGNORECASE):
             result.mark_inconclusive(
                 "PXE/SCCM probe produced no recognizable output (module "

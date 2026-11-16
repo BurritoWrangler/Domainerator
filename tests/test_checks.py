@@ -7,9 +7,26 @@ real external tools installed.
 
 from __future__ import annotations
 
-from domainerator.checks import authenticated, unauthenticated
+from domainerator.checks import (
+    FailureKind,
+    authenticated,
+    classify_failure,
+    looks_like_failure,
+    unauthenticated,
+)
 from domainerator.paths import Capability
 from domainerator.runner import CommandOutput, Target
+
+# Verbatim text from the reported SMBGhost false-positive: a null-session
+# login that the target refused (STATUS_ACCESS_DENIED), not a connectivity
+# failure.
+SMBGHOST_BUG_FIXTURE = (
+    "SMB                      10.40.0.13      445    PRIFS02          "
+    "[*] Windows Server 2019 Datacenter 17763 x64 (name:PRIFS02) "
+    "(domain:abcdomain.com) (signing:True) (SMBv1:True) (Null Auth:True)\n"
+    "SMB                      10.40.0.13      445    PRIFS02          "
+    "[-] abcdomain.com\\: STATUS_ACCESS_DENIED"
+)
 
 
 class FakeRunner:
@@ -305,9 +322,13 @@ def test_auth_failure_marked_inconclusive_by_run_all_postprocess():
     failed = CheckResult(
         name="b", category="authenticated", raw_output="STATUS_LOGON_FAILURE"
     )
-    authenticated._mark_inconclusive_on_failure([clean, failed])
+    denied = CheckResult(
+        name="c", category="authenticated", raw_output="[-] STATUS_ACCESS_DENIED"
+    )
+    authenticated._mark_inconclusive_on_failure([clean, failed, denied])
     assert not clean.inconclusive
     assert failed.inconclusive
+    assert denied.inconclusive
 
 
 def test_ntlmv1_detected_and_emits_step():
@@ -738,3 +759,170 @@ def test_scrape_credentials_from_dir_empty_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         hits = _scrape_credentials_from_dir(Path(tmpdir))
         assert hits == []
+
+
+def test_classify_failure_connectivity_only():
+    result = classify_failure("SMB 10.0.0.10 [-] connection refused")
+    assert result == (FailureKind.CONNECTIVITY, "connection refused")
+
+
+def test_classify_failure_access_denied_only():
+    result = classify_failure("SMB 10.0.0.10 [-] STATUS_ACCESS_DENIED")
+    assert result == (FailureKind.ACCESS_DENIED, "access_denied")
+
+
+def test_classify_failure_both_present_is_connectivity():
+    result = classify_failure(
+        "SMB 10.0.0.10 [-] connection timed out; STATUS_ACCESS_DENIED"
+    )
+    assert result[0] is FailureKind.CONNECTIVITY
+
+
+def test_classify_failure_bug_fixture_is_access_denied():
+    result = classify_failure(SMBGHOST_BUG_FIXTURE)
+    assert result[0] is FailureKind.ACCESS_DENIED
+
+
+def test_classify_failure_bare_dash_with_no_other_signal_is_connectivity():
+    result = classify_failure("SMB 10.0.0.10 [-] no sccm")
+    assert result == (FailureKind.CONNECTIVITY, "[-]")
+
+
+def test_classify_failure_null_auth_banner_is_not_a_signal():
+    result = classify_failure(
+        "SMB 10.0.0.10 445 HOST (signing:True) (SMBv1:False) (Null Auth:True)"
+    )
+    assert result is None
+
+
+def test_classify_failure_no_signal_returns_none():
+    assert classify_failure("all good, nothing to see here") is None
+
+
+def test_looks_like_failure_still_detects_both_kinds():
+    assert looks_like_failure("SMB 10.0.0.10 [-] connection refused") == "connection refused"
+    assert looks_like_failure("SMB 10.0.0.10 [-] STATUS_ACCESS_DENIED") == "access_denied"
+
+
+def test_null_session_access_denied_is_finding_not_inconclusive():
+    res = unauthenticated.check_null_session(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.status == "findings"
+    assert res.inconclusive is False
+    assert any(
+        f.title == "Anonymous SMB session refused" and f.severity.label == "Info"
+        for f in res.findings
+    )
+
+
+def test_null_session_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_null_session(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert res.inconclusive is True
+    assert res.findings == []
+
+
+def test_rid_cycling_access_denied_is_finding_not_inconclusive():
+    res = unauthenticated.check_rid_cycling(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.status == "findings"
+    assert res.inconclusive is False
+    assert any(
+        f.title == "Anonymous RID cycling refused" and f.severity.label == "Info"
+        for f in res.findings
+    )
+
+
+def test_rid_cycling_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_rid_cycling(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert res.inconclusive is True
+    assert res.findings == []
+
+
+def test_ldap_anonymous_bind_access_denied_is_finding_not_inconclusive():
+    res = unauthenticated.check_ldap_anonymous_bind(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.status == "findings"
+    assert res.inconclusive is False
+    assert any(
+        f.title == "Anonymous LDAP bind refused" and f.severity.label == "Info"
+        for f in res.findings
+    )
+
+
+def test_ldap_anonymous_bind_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_ldap_anonymous_bind(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert res.inconclusive is True
+    assert res.findings == []
+
+
+def test_smbghost_bug_fixture_stays_inconclusive_with_access_denied_reason():
+    res = unauthenticated.check_smbghost(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.inconclusive is True
+    assert "refused" in res.inconclusive_reason
+
+
+def test_smbghost_timed_out_stays_inconclusive():
+    res = unauthenticated.check_smbghost(
+        FakeRunner("SMB 10.0.0.10 [-] timed out"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_eternalblue_access_denied_stays_inconclusive_with_specific_reason():
+    res = unauthenticated.check_eternalblue(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.inconclusive is True
+    assert "refused" in res.inconclusive_reason
+
+
+def test_eternalblue_no_route_to_host_stays_inconclusive():
+    res = unauthenticated.check_eternalblue(
+        FakeRunner("SMB 10.0.0.10 [-] no route to host"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_zerologon_access_denied_stays_inconclusive_with_specific_reason():
+    res = unauthenticated.check_zerologon(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.inconclusive is True
+    assert "refused" in res.inconclusive_reason
+
+
+def test_zerologon_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_zerologon(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_printnightmare_access_denied_stays_inconclusive_with_specific_reason():
+    res = unauthenticated.check_printnightmare(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.inconclusive is True
+    assert "refused" in res.inconclusive_reason
+
+
+def test_printnightmare_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_printnightmare(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
+def test_timeroast_access_denied_stays_inconclusive_with_specific_reason():
+    res = unauthenticated.check_timeroast(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
+    assert res.inconclusive is True
+    assert "refused" in res.inconclusive_reason
+
+
+def test_timeroast_no_route_to_host_stays_inconclusive():
+    res = unauthenticated.check_timeroast(
+        FakeRunner("SMB 10.0.0.10 [-] no route to host"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive

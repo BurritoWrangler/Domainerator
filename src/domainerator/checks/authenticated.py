@@ -25,7 +25,7 @@ import re
 
 from ..paths import Capability, Noise, PathStep, Reliability
 from ..runner import CheckResult, Finding, Severity, Target, ToolRunner
-from . import looks_like_failure, require_tool, skipped_result
+from . import classify_failure, looks_like_failure, require_tool, skipped_result
 
 CATEGORY = "authenticated"
 
@@ -1354,11 +1354,12 @@ def _mark_inconclusive_on_failure(results: list[CheckResult]) -> list[CheckResul
     for r in results:
         if r.skipped or r.error or r.findings or r.inconclusive:
             continue
-        signal = looks_like_failure(r.raw_output)
-        if signal:
+        classified = classify_failure(r.raw_output)
+        if classified:
+            kind, signal = classified
             r.mark_inconclusive(
-                f"check ran but output shows '{signal}'; result may not reflect "
-                "the target's true state"
+                f"check ran but output shows a {kind.value} failure ('{signal}'); "
+                "result may not reflect the target's true state"
             )
     return results
 
