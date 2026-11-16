@@ -81,3 +81,12 @@ def test_sccm_pxe_inconclusive_on_unrecognized():
     res = sccm.check_sccm_pxe_naa(FakeRunner("SMB 10.0.0.10  [-] no sccm here x"), ANON_TARGET)
     assert not res.findings
     assert res.inconclusive
+
+
+def test_sccm_pxe_naa_access_denied_stays_inconclusive_with_specific_reason():
+    res = sccm.check_sccm_pxe_naa(
+        FakeRunner("SMB 10.0.0.10 [-] abcdomain.com\\: STATUS_ACCESS_DENIED"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+    assert "refused" in res.inconclusive_reason
