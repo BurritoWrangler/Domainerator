@@ -57,9 +57,14 @@ def check_sccm_discovery(
 
     text = out.combined
     # Look for management-point hostnames / site codes in the output.
+    # Deliberately NOT matching a bare "\bSCCM\b" - that is the module's own
+    # name (`-M sccm`), virtually guaranteed to appear in the command echo
+    # regardless of outcome, the same false-positive shape as the confirmed
+    # timeroast bug. "System Management" (the actual AD container name) is
+    # kept since it is a specific, genuine discovery signal.
     mps = re.findall(r"(?:Management ?Point|mSSMSMPName)\D*([A-Za-z0-9._-]+)", text)
     site_codes = re.findall(r"Site ?Code\D*([A-Za-z0-9]{3})", text)
-    if mps or site_codes or re.search(r"\bSCCM\b|System Management", text, re.IGNORECASE):
+    if mps or site_codes or re.search(r"System Management", text, re.IGNORECASE):
         evidence = text[:600]
         result.add_finding(
             Finding(
@@ -138,7 +143,14 @@ def check_sccm_pxe_naa(
 
     text = out.combined
     pxe_open = re.search(r"PXE.*(enabled|no password|not.*password|open)", text, re.IGNORECASE)
-    naa_found = re.search(r"Network Access Account|NAADomain|\bNAA\b", text, re.IGNORECASE)
+    # Deliberately NOT matching a bare "\bNAA\b" - "NAA" is the standard SCCM
+    # terminology the module's own option/description text almost certainly
+    # uses (it's the exact thing being probed for), so the module merely
+    # describing what it's looking for - rather than having recovered actual
+    # credentials - could satisfy this, the same false-positive shape as the
+    # confirmed timeroast bug. "NAADomain" is a specific recovered-credential
+    # field name nxc prints per hit, so it is kept as a genuine signal.
+    naa_found = re.search(r"Network Access Account|NAADomain", text, re.IGNORECASE)
 
     if naa_found:
         result.add_finding(
