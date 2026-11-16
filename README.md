@@ -195,16 +195,20 @@ The console provides:
 | `unset <NAME>` | Clear a variable |
 | `options` | Show all variables and the placeholders they fill |
 | `grant <capability>` | Manually mark a capability as obtained (recomputes paths) |
+| `verify [id]` | Verify findings are actually exploitable before acting on them |
+| `verify --refresh [id]` | Invalidate cached verification results (all, or one finding) and re-check |
+| `autoexploit <goal>` | One-shot automated exploitation to a goal (`da`, `dcsync`, `ea`, `local-admin`, `rbcd`, `valid-credentials`) |
 | `loot` | List captured credentials/hashes (same as `show loot`) |
 | `loot export [dir]` | Write captured loot to per-kind files (crackable formats) |
 | `targets` | List all scanned hosts and mark the active one |
 | `target <id>` | Switch the active target to a scanned host |
 | `relay [mode] [method]` | Coordinate a background ntlmrelayx listener with a coercion trigger |
-| `scan [check]` | Run additional checks (all or specific) |
+| `scan [check]` | Run additional checks against the active target (all or specific) |
+| `scanall [check]` | Run checks against **every** loaded target, not just the active one |
 | `rescan` | Re-run all checks with current capabilities |
 | `save [file]` | Save session state to file |
 | `report [dir]` | Regenerate Markdown + JSON report from the current session state |
-| `status` | Show session status |
+| `status` | Show session status, including step-execution history and success rate |
 | `exit` / `quit` | Exit console (auto-saves if state file configured) |
 
 ### Command variables
@@ -314,6 +318,78 @@ fewer prompts, not fewer safety checks.
 > every step it *can* run deterministically is run for you, and it stops with a clear
 > instruction exactly where you're needed, then resumes on the next `autorun`.
 
+### Goal-directed exploitation: `autoexploit`
+
+`autorun` walks whichever path you've already `use`'d. `autoexploit <goal>` skips the
+selection step entirely: give it a goal capability and it finds every attack path that
+reaches it, ranks them by reliability, and runs the best one — falling back to the
+next-best path if a step along the way fails, rather than giving up after the first dead
+end.
+
+```
+domainerator > autoexploit da
+domainerator > autoexploit dcsync --preview   # show the plan without running anything
+domainerator > autoexploit ea --dry-run       # show the commands it would run, unexecuted
+```
+
+Goals: `da` (Domain Admin), `dcsync`, `ea` (Enterprise Admin), `local-admin`, `rbcd`,
+`valid-credentials`. `--preview` reports which steps would run unattended versus which need
+you, without executing anything; `--dry-run` executes nothing but prints the fully
+substituted commands. On success, the capabilities gained are merged into the session the
+same way a manual `grant` would be, so `show paths`/`status` reflect the new state
+immediately.
+
+### Verifying findings before you act on them: `verify`
+
+Some findings look exploitable from the check output alone but turn out not to be once you
+actually try them — a coercion target blocked by network controls, an ADCS template you
+don't actually have enrollment rights on, a pre-Windows-2000 computer account whose password
+has since been rotated. `verify` runs a targeted follow-up check against a finding
+(test-coercing a host, checking certificate template enrollment rights, attempting
+authentication with a predicted password) before you commit to exploiting it:
+
+```
+domainerator > verify
+Verification Status:
+------------------------------------------------------------
+  [1] Host vulnerable to PetitPotam coercion - pending
+  [2] ESC1: certificate template allows SAN - pending
+
+domainerator > verify 1
+domainerator > verify --refresh        # invalidate every cached verification result
+domainerator > verify --refresh 1      # invalidate and re-check just finding 1
+```
+
+Verification results are cached for the session (so re-checking the same finding
+immediately doesn't re-run the probe every time); `--refresh` forces a re-check when the
+environment may have changed — a signing requirement flipped, a new CA appeared, an account
+password may have rotated.
+
+### Tracking exploitation progress: `status`
+
+`status` reports where the session stands, including an execution summary built from every
+step the console has actually run (via `run`, `autorun`, or `autoexploit`):
+
+```
+domainerator > status
+
+Session Status:
+  Target: 10.0.0.10
+  Checks run: 14
+  Capabilities: 4
+  Attack paths: 2
+  Steps executed: 3
+  Success rate: 66%
+  Orphaned capabilities: 1 (use 'grant' to track)
+```
+
+"Orphaned capabilities" are capabilities the session holds without a recorded successful
+step that granted them — typically because you used `grant <capability>` manually (e.g.
+after cracking a hash offline) rather than having the console execute and confirm the step
+itself. This is informational, not an error: it's a prompt to double check that a manually
+granted capability is actually backed by real access before relying on it for the rest of
+the path.
+
 ### Multi-target sessions
 
 When you scan more than one host (`--targets hosts.txt`, or repeated `--target`), the
@@ -342,6 +418,29 @@ on. Variables you set explicitly with `set` are treated as operator-owned and ar
 overwritten by a target switch — only auto-derived values follow the active host. The
 attack paths, capabilities, and loot are session-wide, so switching targets changes what
 commands point at without discarding your progress.
+
+`scan`/`rescan` only act on the active target, so covering every loaded host normally means
+`target <id>` + `scan` repeated for each one. `scanall` does this in one step — it scans
+every host in the session concurrently (the same worker pool the CLI's initial multi-target
+pass uses), merges each host's results in, and recomputes attack paths once at the end:
+
+```
+domainerator > scanall unauthenticated
+
+Running unauthenticated checks against 3 target(s): 10.0.0.10, 10.0.0.20, 10.0.0.30
+  10.0.0.10: ran 6 check(s), 1 finding(s), 1 path step(s)
+  10.0.0.20: ran 6 check(s), 0 finding(s), 0 path step(s)
+  10.0.0.30: no checks applicable
+
+Scanned 3 target(s): 12 check(s) total, 1 finding(s), 1 path step(s).
+Capabilities: 2  Attack paths: 1
+Use 'show paths' to view them.
+```
+
+The active target (whatever `target <id>` last selected) is left unchanged by `scanall` —
+it only changes which hosts get scanned, not which one your other commands point at. A host
+that is out of scope still gets a warning (like `scan` already prints for the active
+target), and one host's scan failing never aborts the rest of the batch.
 
 ### Relay orchestration
 
