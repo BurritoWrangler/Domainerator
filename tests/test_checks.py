@@ -840,10 +840,26 @@ def test_smbghost_bug_fixture_stays_inconclusive_with_access_denied_reason():
     assert "refused" in res.inconclusive_reason
 
 
+def test_smbghost_timed_out_stays_inconclusive():
+    res = unauthenticated.check_smbghost(
+        FakeRunner("SMB 10.0.0.10 [-] timed out"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
 def test_eternalblue_access_denied_stays_inconclusive_with_specific_reason():
     res = unauthenticated.check_eternalblue(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
     assert res.inconclusive is True
     assert "refused" in res.inconclusive_reason
+
+
+def test_eternalblue_no_route_to_host_stays_inconclusive():
+    res = unauthenticated.check_eternalblue(
+        FakeRunner("SMB 10.0.0.10 [-] no route to host"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
 
 
 def test_zerologon_access_denied_stays_inconclusive_with_specific_reason():
@@ -866,7 +882,23 @@ def test_printnightmare_access_denied_stays_inconclusive_with_specific_reason():
     assert "refused" in res.inconclusive_reason
 
 
+def test_printnightmare_connection_refused_stays_inconclusive():
+    res = unauthenticated.check_printnightmare(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
 def test_timeroast_access_denied_stays_inconclusive_with_specific_reason():
     res = unauthenticated.check_timeroast(FakeRunner(SMBGHOST_BUG_FIXTURE), ANON_TARGET)
     assert res.inconclusive is True
     assert "refused" in res.inconclusive_reason
+
+
+def test_timeroast_no_route_to_host_stays_inconclusive():
+    res = unauthenticated.check_timeroast(
+        FakeRunner("SMB 10.0.0.10 [-] no route to host"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive

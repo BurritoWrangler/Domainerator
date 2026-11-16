@@ -90,3 +90,11 @@ def test_sccm_pxe_naa_access_denied_stays_inconclusive_with_specific_reason():
     assert not res.findings
     assert res.inconclusive
     assert "refused" in res.inconclusive_reason
+
+
+def test_sccm_pxe_naa_connection_timed_out_stays_inconclusive():
+    res = sccm.check_sccm_pxe_naa(
+        FakeRunner("SMB 10.0.0.10 [-] connection timed out"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
