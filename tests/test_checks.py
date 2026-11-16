@@ -425,6 +425,26 @@ def test_timeroast_inconclusive_on_unrecognized():
     assert res.inconclusive
 
 
+def test_timeroast_banner_alone_is_not_a_finding():
+    """Regression: nxc's timeroast module always prints a 'Starting
+    Timeroasting...' banner line whether or not it recovers any hash, so a
+    bare search for the word 'timeroast'/'sntp-ms' anywhere in the output
+    previously matched that banner and reported a finding on every run -
+    including this exact reported false positive, where a null-session
+    STATUS_ACCESS_DENIED meant the module never queried NTP at all."""
+    output = (
+        "SMB  10.40.0.13  445  PRIFS02  [*] Windows Server 2019 Datacenter "
+        "17763 x64 (name:PRIFS02) (domain:abcDomain.com) (signing:True) "
+        "(SMBv1:True) (Null Auth:True)\n"
+        "SMB  10.40.0.13  445  PRIFS02  [-] abcDomain.com\\: STATUS_ACCESS_DENIED\n"
+        "TIMEROAST  10.40.0.13  445  PRIFS02  [*] Starting Timeroasting..."
+    )
+    res = unauthenticated.check_timeroast(FakeRunner(output), ANON_TARGET)
+    assert not res.findings, "banner-only output with no recovered hash must not be a finding"
+    assert res.inconclusive
+    assert "access_denied" in res.inconclusive_reason.lower()
+
+
 def test_new_checks_registered_in_run_all():
     # GPP and pre-2000 are credentialed -> authenticated module.
     auth_results = authenticated.run_all(FakeRunner("nothing recognizable"), AUTH_TARGET, timeout=60)
