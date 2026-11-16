@@ -9,12 +9,16 @@ from domainerator.console.state_machine import (
     ExploitationStateMachine,
     StepStatus,
 )
+from domainerator.console.variables import Variables
 from domainerator.console.verification import (
+    Pre2KAccountVerifier,
     VerificationCache,
+    VerificationLayer,
     VerificationResult,
     VerificationStatus,
 )
 from domainerator.paths import Capability
+from domainerator.runner import CommandOutput, Finding, Severity, Target
 
 # === Outcome Detection Tests ===
 
@@ -240,6 +244,33 @@ def test_verification_cache_invalidation_by_dependency():
     assert cache.get("other-key") is not None
 
 
+def test_verification_cache_disambiguates_distinct_findings_same_technique_target():
+    """Regression for H2: two findings sharing (technique, target) must not
+    collapse to the same cache key just because Finding has no 'id' field.
+    """
+    finding_a = Finding(
+        title="ESC1: certificate template allows SAN",
+        severity=Severity.CRITICAL,
+        description="x",
+        target="10.0.0.10",
+        evidence="Template Name: VulnTemplateA\nCA Name: corp-CA",
+    )
+    finding_b = Finding(
+        title="ESC1: certificate template allows SAN",
+        severity=Severity.CRITICAL,
+        description="x",
+        target="10.0.0.10",
+        evidence="Template Name: VulnTemplateB\nCA Name: corp-CA",
+    )
+
+    key_a = VerificationLayer.cache_key_for(finding_a, "ESC1")
+    key_b = VerificationLayer.cache_key_for(finding_b, "ESC1")
+
+    assert key_a != key_b
+    # Same finding, called twice, must be stable (reproducible, not random).
+    assert key_a == VerificationLayer.cache_key_for(finding_a, "ESC1")
+
+
 def test_verification_cache_serialization():
     """Test cache serialization."""
     cache = VerificationCache(ttl_minutes=30.0)
@@ -261,3 +292,54 @@ def test_verification_cache_serialization():
     cached = new_cache.get("test-key")
     assert cached is not None
     assert cached.capability_granted == Capability.COERCIBLE_AUTH
+
+
+# === Pre2k loot formatting (H1 regression) ===
+
+
+class _FakeRunner:
+    """Minimal ToolRunner stand-in returning a canned 'Pwn3d!' transcript."""
+
+    def __init__(self, combined: str):
+        self._combined = combined
+
+    def run(self, argv, timeout=None):
+        return CommandOutput(
+            command=" ".join(argv), return_code=0,
+            stdout=self._combined, stderr="", duration_seconds=0.1,
+        )
+
+
+class _FakeSession:
+    """Minimal session stand-in for Pre2KAccountVerifier.verify()."""
+
+    def __init__(self, target: Target):
+        self.target = target
+        self.state = type("S", (), {})()  # no password_policy attribute
+        self.no_verify = False
+        self.variables = Variables()
+
+
+def test_pre2k_verified_loot_uses_single_backslash_separator():
+    """Regression for H1: the loot string must use one backslash between
+    domain and account name, matching DOMAIN\\user:pass conventions used
+    everywhere else (loot.py's CLEARTEXT pattern, nxc output examples)."""
+    target = Target(host="10.0.0.10", domain="CORP")
+    runner = _FakeRunner("[+] CORP\\COMPUTER$:computer Pwn3d!")
+    session = _FakeSession(target)
+    verifier = Pre2KAccountVerifier(runner, session)
+
+    finding = Finding(
+        title="Pre-Windows 2000 computer account",
+        severity=Severity.MEDIUM,
+        description="x",
+        target=target.host,
+        evidence="COMPUTER$",
+    )
+
+    result = verifier.verify(finding)
+
+    assert result.status == VerificationStatus.VERIFIED
+    assert result.loot == ["CORP\\COMPUTER$:computer"]
+    # Exactly one backslash, not two, between domain and account name.
+    assert "\\\\" not in result.loot[0]
