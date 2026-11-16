@@ -464,6 +464,30 @@ def test_anonymous_ftp_detected():
     assert Capability.NETWORK_FOOTHOLD in grants
 
 
+def test_null_session_share_enumeration_detected():
+    """Regression for M2: the finding-emission branch (READ/WRITE tokens
+    present under a null session) must actually fire; previously a dead
+    `"shares" not in text.lower()[:0]` clause was always True, which happened
+    to leave this branch reachable, but was still worth a dedicated test
+    since no test exercised it at all before this fix."""
+    output = (
+        "SMB  10.0.0.10  445  HOST  [+] corp.local\\: \n"
+        "SMB  10.0.0.10  445  HOST  C$             READ,WRITE\n"
+        "SMB  10.0.0.10  445  HOST  NETLOGON       READ\n"
+    )
+    res = unauthenticated.check_null_session(FakeRunner(output), ANON_TARGET)
+    assert any("Anonymous SMB share enumeration possible" in f.title for f in res.findings)
+    assert not res.inconclusive
+
+
+def test_null_session_inconclusive_on_connection_failure():
+    res = unauthenticated.check_null_session(
+        FakeRunner("SMB 10.0.0.10 [-] connection refused"), ANON_TARGET
+    )
+    assert not res.findings
+    assert res.inconclusive
+
+
 def test_nfs_exports_detected():
     output = "| nfs-showmount:\n|   /export/home 10.0.0.0/24\n"
     res = unauthenticated.check_anonymous_ftp_nfs(FakeRunner(output), ANON_TARGET)

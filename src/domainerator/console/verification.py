@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import enum
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -25,6 +26,22 @@ from ..paths import Capability
 if TYPE_CHECKING:
     from ..runner import Finding, ToolRunner
     from .session import Session
+
+
+def _finding_identity(finding: Finding) -> str:
+    """Stable per-finding identifier for cache keys and result bookkeeping.
+
+    ``Finding`` has no ``id`` field, so two distinct findings that share a
+    (technique, target) pair - e.g. two different ESC1-vulnerable ADCS
+    templates on the same CA/target - previously collapsed to the same
+    verification cache key, which could return a cached result that actually
+    belonged to a different finding. Hashing the finding's evidence (its
+    free-form supporting text, which differs whenever the findings are
+    actually different) disambiguates them without requiring a new field on
+    ``Finding`` or touching every call site that constructs one.
+    """
+    basis = f"{finding.title}|{finding.target or ''}|{finding.evidence}"
+    return hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
 class VerificationStatus(enum.Enum):
@@ -200,7 +217,7 @@ class CoercionVerifier:
         if not listener_ip:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Coercion",
                 timestamp=datetime.datetime.now(),
                 detail="LHOST not set; cannot verify coercion. Use 'set LHOST <ip>'.",
@@ -224,7 +241,7 @@ class CoercionVerifier:
         if self._coercion_succeeded(out.combined):
             return VerificationResult(
                 status=VerificationStatus.VERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Coercion",
                 timestamp=datetime.datetime.now(),
                 detail=f"Host {target_host} confirmed coercible to {listener_ip}",
@@ -234,7 +251,7 @@ class CoercionVerifier:
         elif self._coercion_blocked(out.combined):
             return VerificationResult(
                 status=VerificationStatus.NOT_EXPLOITABLE,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Coercion",
                 timestamp=datetime.datetime.now(),
                 detail=f"Coercion blocked on {target_host} (patched or network filter)",
@@ -243,7 +260,7 @@ class CoercionVerifier:
         else:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Coercion",
                 timestamp=datetime.datetime.now(),
                 detail=f"Coercion verification inconclusive: {out.combined[:200]}",
@@ -290,7 +307,7 @@ class ADCSVerifier:
         if not template_name:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=technique,
                 timestamp=datetime.datetime.now(),
                 detail="Could not extract template name from finding",
@@ -319,7 +336,7 @@ class ADCSVerifier:
         if enrollment_status == EnrollmentStatus.CAN_ENROLL:
             return VerificationResult(
                 status=VerificationStatus.VERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=technique,
                 timestamp=datetime.datetime.now(),
                 detail=f"User can enroll in template {template_name}",
@@ -328,7 +345,7 @@ class ADCSVerifier:
         elif enrollment_status == EnrollmentStatus.NEEDS_APPROVAL:
             return VerificationResult(
                 status=VerificationStatus.VERIFIED,  # Still exploitable, just delayed
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=technique,
                 timestamp=datetime.datetime.now(),
                 detail=f"Enrollment in {template_name} requires manager approval",
@@ -337,7 +354,7 @@ class ADCSVerifier:
         elif enrollment_status == EnrollmentStatus.NO_RIGHTS:
             return VerificationResult(
                 status=VerificationStatus.NOT_EXPLOITABLE,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=technique,
                 timestamp=datetime.datetime.now(),
                 detail=(
@@ -349,7 +366,7 @@ class ADCSVerifier:
         else:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=technique,
                 timestamp=datetime.datetime.now(),
                 detail=f"Could not verify enrollment status: {out.combined[:200]}",
@@ -413,7 +430,7 @@ class Pre2KAccountVerifier:
         if getattr(self._session, "no_verify", False) and not force:
             return VerificationResult(
                 status=VerificationStatus.SKIPPED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Pre2k",
                 timestamp=datetime.datetime.now(),
                 detail="--no-verify flag set; skipping authentication attempt",
@@ -423,7 +440,7 @@ class Pre2KAccountVerifier:
         if not account_name:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Pre2k",
                 timestamp=datetime.datetime.now(),
                 detail="Could not extract account name from finding",
@@ -433,7 +450,7 @@ class Pre2KAccountVerifier:
         if self._lockout_is_aggressive() and not force:
             return VerificationResult(
                 status=VerificationStatus.UNVERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Pre2k",
                 timestamp=datetime.datetime.now(),
                 detail=(
@@ -464,10 +481,10 @@ class Pre2KAccountVerifier:
 
         if "Pwn3d!" in out.combined or "[+]" in out.combined:
             domain = target.domain or "DOMAIN"
-            loot = [f"{domain}\\\\{account_name}:{predicted_password}"]
+            loot = [f"{domain}\\{account_name}:{predicted_password}"]
             return VerificationResult(
                 status=VerificationStatus.VERIFIED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Pre2k",
                 timestamp=datetime.datetime.now(),
                 detail=f"Successfully authenticated as {account_name}",
@@ -478,7 +495,7 @@ class Pre2KAccountVerifier:
         else:
             return VerificationResult(
                 status=VerificationStatus.NOT_EXPLOITABLE,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Pre2k",
                 timestamp=datetime.datetime.now(),
                 detail=f"Authentication failed; password for {account_name} has been rotated",
@@ -571,7 +588,7 @@ class VerificationLayer:
         if not tech:
             return VerificationResult(
                 status=VerificationStatus.SKIPPED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique="Unknown",
                 timestamp=datetime.datetime.now(),
                 detail="No verifier for this technique",
@@ -587,7 +604,7 @@ class VerificationLayer:
         if not verifier:
             return VerificationResult(
                 status=VerificationStatus.SKIPPED,
-                finding_id=getattr(finding, "id", ""),
+                finding_id=_finding_identity(finding),
                 technique=tech,
                 timestamp=datetime.datetime.now(),
                 detail=f"No verifier for technique: {tech}",
@@ -619,8 +636,13 @@ class VerificationLayer:
     @staticmethod
     def _cache_key(finding: Finding, technique: str) -> str:
         target = finding.target or "unknown"
-        finding_id = getattr(finding, "id", "")
+        finding_id = _finding_identity(finding)
         return f"{technique}:{target}:{finding_id}"
+
+    @staticmethod
+    def cache_key_for(finding: Finding, technique: str) -> str:
+        """Public alias of ``_cache_key`` for callers/tests outside this class."""
+        return VerificationLayer._cache_key(finding, technique)
 
     def to_dict(self) -> dict:
         """Serialize verification state for persistence."""
