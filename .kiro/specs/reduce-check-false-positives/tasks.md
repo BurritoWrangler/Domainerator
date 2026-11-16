@@ -14,8 +14,8 @@ commit of the spec itself.
 
 ## Tasks
 
-- [ ] 1. Add `FailureKind` and `classify_failure` to `checks/__init__.py`
-  - [ ] 1.1 Replace `_FAILURE_SIGNALS` with `_CONNECTIVITY_FAILURE_SIGNALS` and `_ACCESS_DENIED_SIGNALS`
+- [x] 1. Add `FailureKind` and `classify_failure` to `checks/__init__.py`
+  - [x] 1.1 Replace `_FAILURE_SIGNALS` with `_CONNECTIVITY_FAILURE_SIGNALS` and `_ACCESS_DENIED_SIGNALS`
     - Add `import enum` to `src/domainerator/checks/__init__.py`
     - `_CONNECTIVITY_FAILURE_SIGNALS`: `connection refused`, `connection
       timed out`, `timed out`, `no route to host`, `unable to connect`,
@@ -25,20 +25,20 @@ commit of the spec itself.
     - `_ACCESS_DENIED_SIGNALS`: `access_denied`, `status_access_denied`,
       `logon_failure`, `status_logon_failure`
     - _Requirements: 1.1, 1.2, 1.3, 3.1_
-  - [ ] 1.2 Implement `FailureKind` enum and `classify_failure()`
+  - [x] 1.2 Implement `FailureKind` enum and `classify_failure()`
     - `FailureKind` with `CONNECTIVITY` and `ACCESS_DENIED` members
     - `classify_failure(output) -> tuple[FailureKind, str] | None`: check
       `_CONNECTIVITY_FAILURE_SIGNALS` first, then `_ACCESS_DENIED_SIGNALS`,
       then a bare `"[-]"` fallback classified as `CONNECTIVITY`, then `None`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
-  - [ ] 1.3 Reimplement `looks_like_failure()` as a thin wrapper over `classify_failure()`
+  - [x] 1.3 Reimplement `looks_like_failure()` as a thin wrapper over `classify_failure()`
     - Keep its exact current signature (`str -> str | None`); used
       unconverted by `check_kerberos_user_enum`, `check_gpp_cpassword`, and
       the nmap/raw-socket checks (`check_cisco_smart_install`,
       `check_anonymous_ftp_nfs`, `check_snmp_default_community`,
       `check_ipmi_hash_disclosure`, `check_name_poisoning`)
     - _Requirements: 3.1_
-  - [ ] 1.4 Unit tests for `classify_failure` and `looks_like_failure`
+  - [x] 1.4 Unit tests for `classify_failure` and `looks_like_failure`
     - `test_classify_failure_connectivity_only`
     - `test_classify_failure_access_denied_only`
     - `test_classify_failure_both_present_is_connectivity`
@@ -50,20 +50,20 @@ commit of the spec itself.
     - `test_looks_like_failure_still_detects_both_kinds`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 3.1_
 
-- [ ] 2. Update Category A checks (anonymous-access-is-the-test) in `unauthenticated.py`
-  - [ ] 2.1 `check_null_session`: replace `looks_like_failure(text)` with
+- [x] 2. Update Category A checks (anonymous-access-is-the-test) in `unauthenticated.py`
+  - [x] 2.1 `check_null_session`: replace `looks_like_failure(text)` with
     `classify_failure(text)`; on `ACCESS_DENIED`, add an INFO `Finding`
     titled "Anonymous SMB session refused" instead of calling
     `mark_inconclusive`; on `CONNECTIVITY`, keep `mark_inconclusive` with
     reason text naming the connectivity signal
     - _Requirements: 2.1, 3.1_
-  - [ ] 2.2 `check_rid_cycling`: same pattern, finding titled "Anonymous RID
+  - [x] 2.2 `check_rid_cycling`: same pattern, finding titled "Anonymous RID
     cycling refused"
     - _Requirements: 2.1, 3.1_
-  - [ ] 2.3 `check_ldap_anonymous_bind`: same pattern, finding titled
+  - [x] 2.3 `check_ldap_anonymous_bind`: same pattern, finding titled
     "Anonymous LDAP bind refused"
     - _Requirements: 2.1, 3.1_
-  - [ ] 2.4 Unit tests for Category A checks (required, not optional)
+  - [x] 2.4 Unit tests for Category A checks (required, not optional)
     - Per check: `..._access_denied_is_finding_not_inconclusive` (using the
       reported-bug-shaped fixture; asserts `res.status == "findings"`,
       `res.inconclusive is False`, an INFO-severity finding with the exact
@@ -71,8 +71,8 @@ commit of the spec itself.
       `res.inconclusive is True`, `res.findings == []`)
     - _Requirements: 2.1, 3.1, 3.3, 4.1_
 
-- [ ] 3. Update Category B on-login-module checks in `unauthenticated.py`
-  - [ ] 3.1 `check_smbghost`, `check_eternalblue`, `check_zerologon`,
+- [x] 3. Update Category B on-login-module checks in `unauthenticated.py`
+  - [x] 3.1 `check_smbghost`, `check_eternalblue`, `check_zerologon`,
     `check_printnightmare`: replace `looks_like_failure(text)` with
     `classify_failure(text)`; both `CONNECTIVITY` and `ACCESS_DENIED` keep
     `mark_inconclusive`; the `ACCESS_DENIED` reason text states the
@@ -80,12 +80,12 @@ commit of the spec itself.
     `CONNECTIVITY` reason text is the existing wording with the signal name
     substituted from `classify_failure`'s result
     - _Requirements: 2.2, 2.4, 2.5, 3.1, 4.1_
-  - [ ] 3.2 `check_timeroast`: same substitution; reason text uses generic
+  - [x] 3.2 `check_timeroast`: same substitution; reason text uses generic
     "the login was refused" wording (not "null-session" specifically) since
     this check has an authenticated-or-null fork and an access-denied
     classification can occur on either branch
     - _Requirements: 2.2, 2.4, 2.5, 3.1, 4.1_
-  - [ ] 3.3 Unit tests for Category B checks in `unauthenticated.py`
+  - [x] 3.3 Unit tests for Category B checks in `unauthenticated.py`
     (required for every check in this task, not a sample)
     - Add module-level `SMBGHOST_BUG_FIXTURE` constant (exact text from the
       reported bug) near the top of `tests/test_checks.py`
@@ -109,25 +109,25 @@ commit of the spec itself.
       existing connection-failure test for this check unmodified
     - _Requirements: 2.2, 2.4, 2.5, 3.1, 3.3, 4.1_
 
-- [ ] 4. Update `sccm.py`
-  - [ ] 4.1 `check_sccm_pxe_naa`: replace `looks_like_failure(text)` with
+- [x] 4. Update `sccm.py`
+  - [x] 4.1 `check_sccm_pxe_naa`: replace `looks_like_failure(text)` with
     `classify_failure(text)` on the null-session branch; same reason-text
     pattern as task 3.2 (`check_sccm_discovery` is NOT touched - it has no
     null-probe branch)
     - _Requirements: 2.2, 2.4, 2.5, 3.1, 4.1_
-  - [ ] 4.2 Unit tests in `tests/test_sccm.py` (required)
+  - [x] 4.2 Unit tests in `tests/test_sccm.py` (required)
     - `test_sccm_pxe_naa_access_denied_stays_inconclusive_with_specific_reason`
       (null branch); keep the existing connection-failure equivalent for this
       check unmodified
     - _Requirements: 2.2, 2.4, 2.5, 3.1, 4.1_
 
-- [ ] 5. Update the authenticated-phase post-processor
-  - [ ] 5.1 `_mark_inconclusive_on_failure` in `authenticated.py`: use
+- [x] 5. Update the authenticated-phase post-processor
+  - [x] 5.1 `_mark_inconclusive_on_failure` in `authenticated.py`: use
     `classify_failure` instead of `looks_like_failure`; keep marking
     inconclusive for *both* kinds (rejected supplied credentials are still
     ambiguous, not a hardening signal); reason text names which kind matched
     - _Requirements: 2.5, 3.1, 4.1, 4.3_
-  - [ ] 5.2 Extend the existing
+  - [x] 5.2 Extend the existing
     `test_auth_failure_marked_inconclusive_by_run_all_postprocess` test with
     a third `CheckResult` whose `raw_output` is access-denied-shaped text,
     asserting it is also marked inconclusive
@@ -143,23 +143,23 @@ commit of the spec itself.
     check's status
     - _Requirements: 5.1, 5.2_
 
-- [ ] 7. Verification gate
-  - [ ] 7.1 Run `pytest -q` from the worktree root BEFORE making any code
+- [x] 7. Verification gate
+  - [x] 7.1 Run `pytest -q` from the worktree root BEFORE making any code
     change and record that the baseline is green
     - _Requirements: consolidated Acceptance Criteria 6_
-  - [ ] 7.2 After implementing tasks 1-6, run `pytest -q` from the worktree
+  - [x] 7.2 After implementing tasks 1-6, run `pytest -q` from the worktree
     root again; it must pass with zero failures
     - _Requirements: consolidated Acceptance Criteria 1-6_
-  - [ ] 7.3 Run `ruff check .` from the worktree root; it must pass with zero
+  - [x] 7.3 Run `ruff check .` from the worktree root; it must pass with zero
     findings
     - _Requirements: consolidated Acceptance Criteria 7_
-  - [ ] 7.4 Diff `tests/test_checks.py` and `tests/test_sccm.py` against
+  - [x] 7.4 Diff `tests/test_checks.py` and `tests/test_sccm.py` against
     their pre-change versions and confirm every pre-existing
     connectivity-failure assertion is present and unmodified
     - _Requirements: consolidated Acceptance Criteria 8_
 
-- [ ] 8. Commit the spec
-  - [ ] 8.1 Commit `requirements.md`, `design.md`, `tasks.md` under
+- [x] 8. Commit the spec
+  - [x] 8.1 Commit `requirements.md`, `design.md`, `tasks.md` under
     `.kiro/specs/reduce-check-false-positives/` as a standalone commit in the
     worktree
     - _Requirements: (process, not a product requirement)_
