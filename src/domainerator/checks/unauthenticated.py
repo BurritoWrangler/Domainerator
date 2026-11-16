@@ -957,8 +957,15 @@ def check_timeroast(runner: ToolRunner, target: Target, timeout: int = 180) -> C
 
     text = out.combined
     # Timeroast hashes are emitted in the hashcat -m 31300 "$sntp-ms$" format.
+    # Gate strictly on actually-recovered hashes: nxc's timeroast module always
+    # prints a "[*] Starting Timeroasting..." banner line whether or not it
+    # recovers anything, so searching for the bare word "timeroast"/"sntp-ms"
+    # anywhere in the output matched that banner unconditionally and reported
+    # a finding on every run, success or failure (including null-session
+    # STATUS_ACCESS_DENIED runs where the module never got to query NTP at
+    # all). Only `hashes` being non-empty is real evidence of a recovered hash.
     hashes = re.findall(r"\$sntp-ms\$\S+|\d+:\$sntp-ms\$\S+", text)
-    if hashes or re.search(r"timeroast|sntp-ms", text, re.IGNORECASE):
+    if hashes:
         result.add_finding(
             Finding(
                 title="Timeroastable computer-account hashes obtained",
