@@ -7,6 +7,8 @@ CLI orchestrates which modules run based on the credentials supplied.
 
 from __future__ import annotations
 
+import enum
+
 from ..runner import CheckResult, ToolRunner
 
 
@@ -29,9 +31,10 @@ def require_tool(
     return None
 
 
-# Signals in tool output that indicate we failed to reach/authenticate the
-# target, meaning a "no finding" result is inconclusive rather than clean.
-_FAILURE_SIGNALS = (
+# Signals in tool output that indicate we failed to reach the target (or the
+# tool errored), meaning a "no finding" result is inconclusive rather than
+# clean. A bare "[-]" is handled as a separate fallback in classify_failure.
+_CONNECTIVITY_FAILURE_SIGNALS = (
     "connection refused",
     "connection timed out",
     "timed out",
@@ -39,30 +42,52 @@ _FAILURE_SIGNALS = (
     "unable to connect",
     "could not connect",
     "authentication failed",
-    "logon_failure",
-    "status_logon_failure",
-    "access_denied",
-    "status_access_denied",
     "error",
     "traceback",
-    # NetExec prints "[-]" for a negative/failed result and "[+]"/"[*]" for a
-    # positive one. A "[-]" line means the module did not succeed, so a check
-    # that parsed no finding cannot be called clean. Listing it here also stops
-    # a negative line that happens to mention a keyword (e.g. "[-] no sccm")
-    # from defeating the per-check "no recognizable output" guard.
-    "[-]",
 )
+
+# Signals showing the target answered but refused the login. For a null-session
+# probe this is a legitimate "anonymous access denied" result, not a failure to
+# reach the host.
+_ACCESS_DENIED_SIGNALS = (
+    "access_denied",
+    "status_access_denied",
+    "logon_failure",
+    "status_logon_failure",
+)
+
+
+class FailureKind(enum.Enum):
+    """Why a tool run produced no usable result."""
+
+    CONNECTIVITY = "connectivity"
+    ACCESS_DENIED = "access_denied"
+
+
+def classify_failure(output: str) -> tuple[FailureKind, str] | None:
+    """Classify a failure in ``output`` as ``(kind, matched_signal)``, or None.
+
+    Connectivity signals win over access-denied signals when both appear. A
+    bare NetExec ``[-]`` line with no other signal is treated as connectivity,
+    so a negative line that mentions a keyword (e.g. "[-] no sccm") cannot
+    defeat the per-check "no recognizable output" guard.
+    """
+    lowered = output.lower()
+    for signal in _CONNECTIVITY_FAILURE_SIGNALS:
+        if signal in lowered:
+            return FailureKind.CONNECTIVITY, signal
+    for signal in _ACCESS_DENIED_SIGNALS:
+        if signal in lowered:
+            return FailureKind.ACCESS_DENIED, signal
+    if "[-]" in lowered:
+        return FailureKind.CONNECTIVITY, "[-]"
+    return None
 
 
 def looks_like_failure(output: str) -> str | None:
     """Return the matched failure signal in ``output``, or None.
 
-    Used to mark a check inconclusive: if a check found nothing *and* the
-    output shows a connection/auth failure, we cannot conclude the target is
-    clean - the tool never got far enough to tell.
+    Thin wrapper over :func:`classify_failure` that ignores the kind.
     """
-    lowered = output.lower()
-    for signal in _FAILURE_SIGNALS:
-        if signal in lowered:
-            return signal
-    return None
+    result = classify_failure(output)
+    return result[1] if result else None
