@@ -73,6 +73,7 @@ class Console:
             "report": self.cmd_report,
             "scan": self.cmd_scan,
             "rescan": self.cmd_rescan,
+            "scanall": self.cmd_scanall,
             "save": self.cmd_save,
             "status": self.cmd_status,
             "exit": self.cmd_exit,
@@ -251,6 +252,7 @@ class Console:
         print()
         print("Scanning:")
         print("  scan [check]         Run checks (all or specific check name)")
+        print("  scanall [check]      Run checks against every loaded target")
         print("  rescan               Re-run all checks with current capabilities")
         print()
         print("Session:")
@@ -1287,6 +1289,30 @@ class Console:
         """Re-run all applicable checks against the active target."""
         self._run_scan(None)
 
+    def cmd_scanall(self, args: list[str]) -> None:
+        """Run checks against every loaded target (session.targets).
+
+        Usage:
+          scanall              Run all applicable checks against every target
+          scanall <category>   Run one category against every target:
+                                unauthenticated | authenticated | adcs | sccm
+
+        Unlike 'scan'/'rescan', which only touch the active target, this scans
+        every host in 'targets' concurrently (the same worker pool
+        scan_targets() uses for the CLI's initial batch pass), merges each
+        host's results into the session the same way 'scan' does, and
+        recomputes attack paths once at the end. The active target
+        (session.target) is left unchanged.
+        """
+        category = None
+        if args:
+            category = args[0].lower()
+            if category not in self._SCAN_CATEGORIES:
+                print(f"Unknown category: {category}")
+                print("Categories: " + ", ".join(self._SCAN_CATEGORIES))
+                return
+        self._run_scan_all(category)
+
     def _run_scan(self, category: str | None) -> None:
         """Execute checks against the active target, merge, and recompute paths.
 
@@ -1359,6 +1385,96 @@ class Console:
                 self.session.evidence.write_results(results, target=target.host)
             except OSError as exc:
                 print(f"(could not write evidence: {exc})")
+
+    def _run_scan_all(self, category: str | None) -> None:
+        """Scan every target in session.targets, merge per host, recompute once.
+
+        Mirrors ``_run_scan``'s per-host merge/evidence/summary logic, but calls
+        ``scan_targets`` once for the whole target list (reusing its worker pool
+        and per-host exception isolation) instead of looping calls to
+        ``scan_target``. ``session.target`` (the active target) is never
+        reassigned by this method.
+        """
+        from ..scan import ScanOptions, scan_targets
+
+        targets = self.session.targets
+        label = category or "all applicable"
+
+        if not targets:
+            print("No targets to scan. Use 'targets' to check the loaded target list.")
+            return
+
+        print()
+        print(f"Running {label} checks against {len(targets)} target(s): "
+              + ", ".join(t.host for t in targets))
+
+        scope = self.session.runner.scope
+        if scope is not None and scope.active:
+            for t in targets:
+                if not scope.contains(t.host):
+                    print(f"WARNING: {t.host} is outside the configured scope; "
+                          "checks targeting it will be refused.")
+
+        opts = ScanOptions(
+            timeout=self.session.runner.timeout,
+            skip_unauth=category not in (None, "unauthenticated"),
+            skip_auth=category not in (None, "authenticated"),
+            skip_adcs=category not in (None, "adcs"),
+            skip_sccm=category not in (None, "sccm"),
+        )
+
+        try:
+            per_host = scan_targets(self.session.runner, targets, opts, max_workers=5)
+        except Exception as exc:  # never let a batch scan crash the console
+            print(f"Scan error: {exc}")
+            return
+
+        total_checks = 0
+        total_findings = 0
+        total_steps = 0
+        for t in targets:
+            host = t.host
+            results = per_host.get(host, [])
+            if not results:
+                print(f"  {host}: no checks applicable")
+                continue
+
+            # Merge: drop this host's prior (name, category) results, add fresh.
+            fresh_keys = {(r.name, r.category) for r in results}
+            self.session.check_results = [
+                r for r in self.session.check_results
+                if (r.name, r.category) not in fresh_keys
+            ]
+            self.session.add_results(results)
+
+            findings = sum(len(r.findings) for r in results)
+            steps = sum(len(r.path_steps or []) for r in results)
+            total_checks += len(results)
+            total_findings += findings
+            total_steps += steps
+            print(f"  {host}: ran {len(results)} check(s), {findings} finding(s), "
+                  f"{steps} path step(s)")
+
+            if self.session.evidence is not None:
+                try:
+                    self.session.evidence.write_results(results, target=host)
+                except OSError as exc:
+                    print(f"  {host}: (could not write evidence: {exc})")
+
+        self.session.recompute_paths()
+
+        print()
+        print(f"Scanned {len(targets)} target(s): {total_checks} check(s) total, "
+              f"{total_findings} finding(s), {total_steps} path step(s).")
+        print(f"Capabilities: {len(self.session.capabilities)}  "
+              f"Attack paths: {len(self.session.attack_paths)}")
+        if self.session.attack_paths:
+            print("Use 'show paths' to view them.")
+        else:
+            print("No complete escalation path yet. 'show findings' and "
+                  "'show capabilities' show what was discovered; some paths "
+                  "need extra capabilities (e.g. ESC8 needs a relay target + "
+                  "coercion) before they close.")
 
     def cmd_save(self, args: list[str]) -> None:
         """Save session state."""

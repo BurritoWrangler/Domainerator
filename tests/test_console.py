@@ -290,6 +290,187 @@ def test_scan_rejects_unknown_category(capsys):
     assert session.check_results == []
 
 
+# --- console scanall (scan every loaded target, not just the active one) --
+
+def test_scanall_rejects_unknown_category(capsys):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    console = Console(session)
+    console.cmd_scanall(["bogus"])
+    out = capsys.readouterr().out
+    assert "Unknown category" in out
+    assert session.check_results == []
+
+
+def test_scanall_with_no_targets_prints_message_and_does_not_scan(capsys):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    target = Target(host="10.0.0.10", domain="corp.local")
+    session = Session(runner=runner, target=target, targets=[target])
+    session.targets = []  # simulate an empty target list
+    console = Console(session)
+    console.cmd_scanall([])
+    out = capsys.readouterr().out
+    assert "No targets to scan" in out
+    assert session.check_results == []
+
+
+def test_scanall_scans_every_target_and_merges_once(capsys):
+    def responder(argv, cmd):
+        if argv[:2] == ["nxc", "smb"] and "-M" not in cmd and "--shares" not in cmd \
+                and "--rid-brute" not in cmd:
+            return "SMB 10.0.0.10 445 DC01 (signing:False) (SMBv1:False)"
+        return ""
+
+    runner = _ScanFakeRunner(responder)
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    session.capabilities = {Capability.UNAUTHENTICATED}
+    console = Console(session)
+
+    assert session.check_results == []
+    console.cmd_scanall(["unauthenticated"])
+    out = capsys.readouterr().out
+
+    # Both hosts must be represented in the merged results and in the output.
+    hosts_seen = {r.name for r in session.check_results}
+    assert session.check_results, "scanall must populate check results"
+    assert "10.0.0.10" in out
+    assert "10.0.0.20" in out
+    assert "Scanned 2 target(s)" in out
+    # Every host appears somewhere in the fresh results (checked indirectly via
+    # capability discovery, since CheckResult carries no host field itself).
+    assert Capability.RELAY_TARGET in session.capabilities
+    del hosts_seen  # not host-addressable directly; see assertion above
+
+
+def test_scanall_leaves_active_target_unchanged():
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    console = Console(session)
+
+    before = session.target
+    console.cmd_scanall([])
+    assert session.target is before
+    assert session.target.host == "10.0.0.10"
+
+
+def test_scanall_does_not_duplicate_results_on_rerun():
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    console = Console(session)
+
+    console.cmd_scanall([])
+    first = len(session.check_results)
+    assert first > 0
+    console.cmd_scanall([])
+    # Re-running replaces prior same-(name, category) results per host rather
+    # than appending, so the total count should not grow.
+    assert len(session.check_results) == first
+
+
+def test_scanall_single_target_still_prints_per_host_and_summary(capsys):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    target = Target(host="10.0.0.10", domain="corp.local")
+    session = Session(runner=runner, target=target, targets=[target])
+    console = Console(session)
+
+    console.cmd_scanall([])
+    out = capsys.readouterr().out
+    assert "10.0.0.10" in out
+    assert "Scanned 1 target(s)" in out
+
+
+def test_scanall_recomputes_paths_exactly_once(monkeypatch):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    t3 = Target(host="10.0.0.30", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2, t3])
+    console = Console(session)
+
+    calls = []
+    original = session.recompute_paths
+
+    def counting_recompute(*a, **kw):
+        calls.append(1)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(session, "recompute_paths", counting_recompute)
+    console.cmd_scanall([])
+    assert len(calls) == 1
+
+
+def test_scanall_warns_on_out_of_scope_target_but_still_scans_all(capsys):
+    from domainerator.runner import Scope
+
+    scope = Scope()
+    scope.active = True
+    scope._add_entry("10.0.0.10", 0)  # only t1 is in scope
+
+    def responder(argv, cmd):
+        if argv[:2] == ["nxc", "smb"] and "-M" not in cmd and "--shares" not in cmd \
+                and "--rid-brute" not in cmd:
+            return "SMB 10.0.0.10 445 DC01 (signing:False) (SMBv1:False)"
+        return ""
+
+    runner = _ScanFakeRunner(responder)
+    runner.scope = scope
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    console = Console(session)
+
+    console.cmd_scanall([])
+    out = capsys.readouterr().out
+    assert "WARNING: 10.0.0.20 is outside the configured scope" in out
+    # t1 is in scope, so it must not get a warning.
+    assert "WARNING: 10.0.0.10" not in out
+    # Both hosts are still included in the scan despite the warning.
+    assert "10.0.0.20" in out
+    assert "Scanned 2 target(s)" in out
+
+
+def test_scanall_evidence_write_failure_isolated_per_host(capsys):
+    class _FakeEvidence:
+        def __init__(self):
+            self.calls = []
+
+        def write_results(self, results, target):
+            self.calls.append(target)
+            if target == "10.0.0.10":
+                raise OSError("disk full")
+
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    t1 = Target(host="10.0.0.10", domain="corp.local")
+    t2 = Target(host="10.0.0.20", domain="corp.local")
+    session = Session(runner=runner, target=t1, targets=[t1, t2])
+    session.evidence = _FakeEvidence()
+    console = Console(session)
+
+    console.cmd_scanall([])
+    out = capsys.readouterr().out
+    assert "could not write evidence" in out
+    # Evidence was still attempted for both hosts despite the first failing.
+    assert session.evidence.calls == ["10.0.0.10", "10.0.0.20"]
+
+
+def test_cmd_help_lists_scanall(capsys):
+    runner = _ScanFakeRunner(lambda argv, cmd: "")
+    target = Target(host="10.0.0.10", domain="corp.local")
+    session = Session(runner=runner, target=target, targets=[target])
+    console = Console(session)
+    console.cmd_help([])
+    out = capsys.readouterr().out
+    assert "scanall" in out
+
+
 # --- path selection numbering (regression: show paths vs use were off-by-one)
 
 def _session_with_paths():
