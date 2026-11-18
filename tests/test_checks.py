@@ -256,6 +256,30 @@ def test_laps_readability_bare_attribute_name_alone_is_not_a_finding():
     assert not res.findings
 
 
+def test_laps_readability_bind_success_echo_is_not_a_finding():
+    """Regression (reported false positive): nxc's own LDAP bind-success
+    banner echoes the operator's supplied credential as
+    "[+] domain\\username:password" - the literal word "password" right
+    after a colon previously satisfied the artifact regex even though it
+    has nothing to do with LAPS, and the module's explicit NEGATIVE result
+    line ("No result found with attribute ms-MCS-AdmPwd or
+    msLAPS-Password !") was also misread as a recovered artifact because
+    "msLAPS-Password" contains a hyphen the old regex accepted as a
+    separator. Neither must produce a finding."""
+    output = (
+        "LDAP  172.16.0.200  389  DC1  [*] Windows 10 / Server 2016 Build "
+        "14393 (name:DC1) (domain:scc.domain.com) (signing:None) "
+        "(channel binding:Never)\n"
+        "LDAP  172.16.0.200  389  DC1  [+] scc.domain.com\\r7t:password\n"
+        "LAPS  172.16.0.200  389  DC1  [*] Getting LAPS Passwords\n"
+        "LAPS  172.16.0.200  389  DC1  [-] No result found with attribute "
+        "ms-MCS-AdmPwd or msLAPS-Password !"
+    )
+    res = authenticated.check_laps_readability(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+    assert not res.path_steps
+
+
 def test_gmsa_readability_decodes_hash_and_grants_capability():
     output = "LDAP  10.0.0.10  GMSA  Account: svc_app$   NTLM: aad3b435b51404eeaad3b435b51404ee"
     res = authenticated.check_gmsa_readability(FakeRunner(output), AUTH_TARGET)

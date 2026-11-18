@@ -857,14 +857,31 @@ def check_laps_readability(
         return result
 
     text = out.combined
-    # The laps module prints recovered "Host: ... Password: ..." pairs.
-    # Deliberately NOT matching a bare "ms-mcs-admpwd"/"laps...password" -
-    # ms-Mcs-AdmPwd is the LAPS attribute name, which is plausible
-    # banner/description text for the -M laps module ("Checking
-    # ms-Mcs-AdmPwd readability...") independent of whether any password was
-    # actually read; the same false-positive shape as the confirmed timeroast
-    # bug. Rely solely on the extracted host/password artifact.
-    hosts = re.findall(r"([A-Za-z0-9._-]+\$?)\s*[:\-]\s*Password", text, re.IGNORECASE)
+    # The laps module prints recovered "HOST$: Password: <value>" lines.
+    # Two confirmed false-positive shapes the previous version of this
+    # regex (`[A-Za-z0-9._-]+\$?\s*[:\-]\s*Password`, no required value)
+    # could still match:
+    #   1. nxc's own LDAP bind-success banner line, e.g.
+    #      "[+] domain.com\username:password" - the literal word "password"
+    #      (lowercase, the operator's own supplied credential) right after a
+    #      colon satisfies a case-insensitive "name:Password" search even
+    #      though this has nothing to do with LAPS.
+    #   2. The module's own explicit NEGATIVE result line, e.g. "No result
+    #      found with attribute ms-MCS-AdmPwd or msLAPS-Password !" - the
+    #      hyphen in "msLAPS-Password" satisfies the "[:\-]" separator, so
+    #      "msLAPS-Password" itself gets misread as a "no result found"
+    #      failure being treated as a recovered artifact.
+    # Both are the same false-positive shape as the confirmed timeroast bug:
+    # matching the tool's own echoed/negative text rather than a genuine
+    # recovered secret. Require the specific "<computer$>: Password: <value>"
+    # shape instead - a $-suffixed computer account name (LAPS only applies
+    # to computer accounts), the literal word "Password" with its own colon,
+    # and a non-empty value after it - which the confirmed false positives
+    # above do not produce.
+    hosts = re.findall(
+        r"([A-Za-z0-9._-]+\$)\s*:\s*Password\s*:\s*(\S+)", text, re.IGNORECASE
+    )
+    hosts = [h for h, _ in hosts]
     if hosts:
         names = ", ".join(sorted(set(hosts)))[:200]
         result.add_finding(
