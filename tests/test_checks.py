@@ -91,6 +91,17 @@ def test_webdav_quiet_when_not_present():
     assert not res.path_steps
 
 
+def test_webdav_module_tag_plus_unrelated_enabled_word_is_not_a_finding():
+    """Regression: nxc prefixes every line from this module with the
+    protocol tag WEBDAV, so a bare '\\bWEBDAV\\b.*enabled' match could
+    previously fire from the module's own tag plus an unrelated 'enabled'
+    word on the same line, without the WebClient service actually being
+    confirmed enabled."""
+    output = "SMB  10.0.0.20  WEBDAV  module enabled, scanning for WebClient service"
+    res = unauthenticated.check_webdav(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+
+
 def test_coercion_detects_and_emits_step():
     output = (
         "SMB  10.0.0.10  COERCE_PLUS  MS-EFSR (EfsRpcOpenFileRaw) VULNERABLE\n"
@@ -105,6 +116,42 @@ def test_coercion_detects_and_emits_step():
 def test_coercion_quiet_when_not_vulnerable():
     res = authenticated.check_coercion(FakeRunner("SMB 10.0.0.10  nothing"), AUTH_TARGET)
     assert not res.findings
+
+
+def test_coercion_module_name_alone_is_not_a_finding():
+    """Regression: 'coerc' is a substring of the coerce_plus module's own
+    name, so a buffer-wide (not line-scoped) 'vulnerable|coerc' search could
+    previously fire from the module merely describing itself, combined with
+    an unrelated line elsewhere mentioning one of the protocol names, with
+    neither on the same line as an actual VULNERABLE verdict."""
+    output = (
+        "SMB  10.0.0.10  COERCE_PLUS  Running coerce_plus module (coercion check)\n"
+        "SMB  10.0.0.10  SMB  MS-RPRN spooler service detected (unrelated line)\n"
+    )
+    res = authenticated.check_coercion(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
+def test_delegation_detects_unconstrained():
+    output = "LDAP  10.0.0.10  Unconstrained delegation: DC01$"
+    res = authenticated.check_delegation(FakeRunner(output), AUTH_TARGET)
+    assert any("Unconstrained" in f.title for f in res.findings)
+
+
+def test_delegation_bare_flag_name_alone_is_not_a_finding():
+    """Regression: a bare 'Constrained|delegation' search matched the
+    --find-delegation flag's own likely banner/description text (which
+    necessarily contains the word 'delegation') with no account actually
+    found and no negation handling."""
+    output = "LDAP  10.0.0.10  Running --find-delegation module (checking delegation)"
+    res = authenticated.check_delegation(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
+def test_delegation_detects_constrained_with_account():
+    output = "LDAP  10.0.0.10  svc_app$  Delegation Type: Constrained"
+    res = authenticated.check_delegation(FakeRunner(output), AUTH_TARGET)
+    assert any("Delegation configured" in f.title for f in res.findings)
 
 
 # --- Phase 1 roadmap: Zerologon, Kerberos user enum, DNS zone transfer -----
@@ -201,6 +248,38 @@ def test_laps_readability_skips_without_creds():
     assert res.skipped
 
 
+def test_laps_readability_bare_attribute_name_alone_is_not_a_finding():
+    """Regression: a bare 'ms-mcs-admpwd' match previously fired from the
+    module's own description text with no password actually read."""
+    output = "LDAP  10.0.0.10  LAPS  Checking ms-Mcs-AdmPwd readability..."
+    res = authenticated.check_laps_readability(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
+def test_laps_readability_bind_success_echo_is_not_a_finding():
+    """Regression (reported false positive): nxc's own LDAP bind-success
+    banner echoes the operator's supplied credential as
+    "[+] domain\\username:password" - the literal word "password" right
+    after a colon previously satisfied the artifact regex even though it
+    has nothing to do with LAPS, and the module's explicit NEGATIVE result
+    line ("No result found with attribute ms-MCS-AdmPwd or
+    msLAPS-Password !") was also misread as a recovered artifact because
+    "msLAPS-Password" contains a hyphen the old regex accepted as a
+    separator. Neither must produce a finding."""
+    output = (
+        "LDAP  172.16.0.200  389  DC1  [*] Windows 10 / Server 2016 Build "
+        "14393 (name:DC1) (domain:scc.domain.com) (signing:None) "
+        "(channel binding:Never)\n"
+        "LDAP  172.16.0.200  389  DC1  [+] scc.domain.com\\r7t:password\n"
+        "LAPS  172.16.0.200  389  DC1  [*] Getting LAPS Passwords\n"
+        "LAPS  172.16.0.200  389  DC1  [-] No result found with attribute "
+        "ms-MCS-AdmPwd or msLAPS-Password !"
+    )
+    res = authenticated.check_laps_readability(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+    assert not res.path_steps
+
+
 def test_gmsa_readability_decodes_hash_and_grants_capability():
     output = "LDAP  10.0.0.10  GMSA  Account: svc_app$   NTLM: aad3b435b51404eeaad3b435b51404ee"
     res = authenticated.check_gmsa_readability(FakeRunner(output), AUTH_TARGET)
@@ -292,6 +371,17 @@ def test_nopac_detects_and_emits_dcsync_step():
     assert Capability.DCSYNC in grants
 
 
+def test_nopac_negated_not_vulnerable_is_not_a_finding():
+    """Regression: a negated 'not vulnerable to noPac' result line contains
+    the bare substring 'vulnerable' (and the module tag 'nopac'), which
+    previously satisfied the unanchored finding condition despite being an
+    explicit negative result - the same false-positive shape as the
+    confirmed timeroast bug."""
+    output = "SMB  10.0.0.10  NOPAC  Not vulnerable to noPac"
+    res = authenticated.check_nopac(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
 def test_ldap_relay_exposure_detects_and_emits_step():
     output = (
         "LDAP  10.0.0.10  LDAP Signing NOT Enforced\n"
@@ -346,6 +436,16 @@ def test_ntlmv1_inconclusive_on_unrecognized_output():
     assert res.inconclusive
 
 
+def test_ntlmv1_generic_verb_near_module_name_is_not_a_finding():
+    """Regression: an unbounded 'NTLMv1.*(allow|enabl|vulnerab)' match with
+    no explicit success token previously fired from loose verb-adjacent
+    text (e.g. a disclaimer) rather than the module's actual 'NTLMv1
+    allowed' positive-result phrase."""
+    output = "SMB  10.0.0.10  NTLMV1  this module checks whether NTLMv1 might be enabled"
+    res = unauthenticated.check_ntlmv1(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+
+
 def test_ntlm_reflection_detected_and_emits_step():
     output = "SMB  10.0.0.10  NTLM_REFLECTION  Host is VULNERABLE to NTLM reflection"
     res = unauthenticated.check_ntlm_reflection(FakeRunner(output), ANON_TARGET)
@@ -360,6 +460,16 @@ def test_ntlm_reflection_inconclusive_on_unrecognized_output():
     )
     assert not res.findings
     assert res.inconclusive
+
+
+def test_ntlm_reflection_bare_vulnerable_word_unrelated_to_module_is_not_a_finding():
+    """Regression: a bare '\\bVULNERABLE\\b' match with zero context-binding
+    to the ntlm_reflection module previously fired from the word
+    'VULNERABLE' appearing anywhere in the combined buffer, even on a line
+    about a completely different technique."""
+    output = "SMB  10.0.0.10  SMBGHOST  unrelated finding text mentions VULNERABLE here"
+    res = unauthenticated.check_ntlm_reflection(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
 
 
 # --- GPP cpassword, pre-2000 computers, timeroasting -----------------------
@@ -377,6 +487,15 @@ def test_gpp_cpassword_skips_without_creds():
     assert res.skipped
 
 
+def test_gpp_cpassword_bare_attribute_name_alone_is_not_a_finding():
+    """Regression: a bare 'cpassword' match previously fired from the
+    module's own description text ('Searching for cpassword in SYSVOL...')
+    with no credential actually recovered."""
+    output = "SMB  10.0.0.10  GPP  Searching for cpassword in SYSVOL..."
+    res = authenticated.check_gpp_cpassword(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
 def test_gpp_cpassword_inconclusive_on_unrecognized():
     res = authenticated.check_gpp_cpassword(FakeRunner("SMB 10.0.0.10 [-] blah"), AUTH_TARGET)
     assert not res.findings
@@ -389,6 +508,17 @@ def test_pre2k_detects_vulnerable_computer_and_emits_step():
     assert any("Pre-Windows 2000" in f.title for f in res.findings)
     grants = {s.grants for s in res.path_steps}
     assert Capability.VALID_CREDENTIALS in grants
+
+
+def test_pre2k_bare_flag_name_and_dollar_token_alone_is_not_a_finding():
+    """Regression: a bare 'pre2k' fallback (the module's own flag name,
+    `-M pre2k`) and a loose '[A-Za-z0-9._-]+\\$' 'artifact' (matching ANY
+    $-suffixed token, not necessarily a flagged account) previously fired
+    together from command-echo text with no account actually confirmed
+    vulnerable."""
+    output = "LDAP  10.0.0.10  Running -M pre2k module against CORP$ domain"
+    res = authenticated.check_pre2k_computers(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
 
 
 def test_pre2k_inconclusive_on_unrecognized():
@@ -479,6 +609,20 @@ def test_cisco_smart_install_inconclusive_when_unknown():
     assert res.inconclusive
 
 
+def test_cisco_smart_install_negated_result_is_not_a_finding():
+    """Regression: a negated 'Smart Install is NOT enabled' result line
+    previously had no negative-case handling (unlike check_zerologon's
+    explicit 'not vulnerable' guard), so the bare presence of 'Smart
+    Install'/'is enabled' keywords could satisfy the finding condition
+    despite the explicit negative verdict."""
+    output = (
+        "4786/tcp open  smart-install\n"
+        "| cisco-smart-install: Smart Install is NOT enabled\n"
+    )
+    res = unauthenticated.check_cisco_smart_install(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+
+
 def test_eternalblue_detected_and_emits_foothold():
     output = "SMB  10.0.0.10  445  HOST  [+] HOST (name:HOST) MS17-010 VULNERABLE"
     res = unauthenticated.check_eternalblue(FakeRunner(output), ANON_TARGET)
@@ -537,6 +681,20 @@ def test_nfs_exports_detected():
     assert Capability.NETWORK_FOOTHOLD in grants
 
 
+def test_nfs_exports_unrelated_slash_text_elsewhere_is_not_a_finding():
+    """Regression: a slash-prefixed token appearing ANYWHERE in the combined
+    nmap output (not actually inside the nfs-showmount script's own block)
+    previously satisfied the export check - e.g. an unrelated comment or URL
+    elsewhere in the output."""
+    output = (
+        "| nfs-showmount:\n"
+        "|_  mount failed: RPC: Program not registered\n"
+        "| some-other-script: see https://example.com/docs for details\n"
+    )
+    res = unauthenticated.check_anonymous_ftp_nfs(FakeRunner(output), ANON_TARGET)
+    assert not any("NFS" in f.title for f in res.findings)
+
+
 def test_ftp_nfs_inconclusive_when_ports_absent():
     res = unauthenticated.check_anonymous_ftp_nfs(
         FakeRunner("Note: Host seems down."), ANON_TARGET
@@ -563,6 +721,17 @@ def test_snmp_inconclusive_when_filtered():
     )
     assert not res.findings
     assert res.inconclusive
+
+
+def test_snmp_info_header_alone_without_recovered_content_is_not_a_finding():
+    """Regression: the snmp-info fallback previously only required the
+    script's own header to be present (plus the port being open) - nmap
+    prints that header whenever the script RUNS, independent of whether it
+    actually received a response, so a bare header with nothing recovered
+    after it must not be a finding."""
+    output = "161/udp open  snmp\n| snmp-info:\n"
+    res = unauthenticated.check_snmp_default_community(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
 
 
 def test_network_foothold_chains_to_domain_user():
@@ -626,6 +795,16 @@ def test_printnightmare_inconclusive_when_absent():
     assert res.inconclusive
 
 
+def test_printnightmare_bare_cve_name_alone_is_not_a_finding():
+    """Regression: a bare 'PrintNightmare' CVE-name alternative previously
+    fired from the spooler module's own help/description text (which exists
+    specifically to probe for PrintNightmare) without the service actually
+    being confirmed reachable/enabled."""
+    output = "SMB  10.0.0.10  SPOOLER  checking for PrintNightmare (CVE-2021-34527)"
+    res = unauthenticated.check_printnightmare(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
+
+
 def test_ipmi_hash_disclosure_grants_crackable_hash():
     output = (
         "623/udp open  asf-rmcp\n"
@@ -644,6 +823,20 @@ def test_ipmi_inconclusive_when_filtered():
     )
     assert not res.findings
     assert res.inconclusive
+
+
+def test_ipmi_protocol_version_only_is_demoted_to_info_not_hash_disclosure():
+    """Regression: detecting IPMI 2.0 only confirms the protocol version is
+    in use - it previously triggered the same HIGH 'hash disclosure'
+    finding as an actually-dumped hash, over-claiming CVE-2013-4786 from
+    mere version detection. Protocol-version-only should be a separate,
+    lower-severity INFO finding with no crackable-hash capability grant."""
+    output = "623/udp open  asf-rmcp\n| ipmi-version: IPMI-2.0\n"
+    res = unauthenticated.check_ipmi_hash_disclosure(FakeRunner(output), ANON_TARGET)
+    assert any(f.severity.label == "Info" for f in res.findings)
+    assert not any("CVE-2013-4786" in f.title for f in res.findings)
+    grants = {s.grants for s in res.path_steps}
+    assert Capability.CRACKABLE_HASH not in grants
 
 
 def test_name_poisoning_exposure_grants_crackable_hash():
@@ -876,6 +1069,14 @@ def test_ldap_anonymous_bind_connection_refused_stays_inconclusive():
     )
     assert res.inconclusive is True
     assert res.findings == []
+
+
+def test_ldap_anonymous_bind_success_detected():
+    """The anonymous-bind-success line nxc prints, anchored the same way a
+    failed null-session shows '[-] domain.com\\: STATUS_...'."""
+    output = "LDAP  10.0.0.10  389  DC01  [+] corp.local\\:"
+    res = unauthenticated.check_ldap_anonymous_bind(FakeRunner(output), ANON_TARGET)
+    assert any("ldap anonymous bind allowed" in f.title.lower() for f in res.findings)
 
 
 def test_smbghost_bug_fixture_stays_inconclusive_with_access_denied_reason():

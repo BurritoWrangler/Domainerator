@@ -310,8 +310,14 @@ def check_ldap_anonymous_bind(
         result.error = out.error
         return result
 
-    # A successful anonymous bind typically shows a [+] with the domain.
-    if re.search(r"\[\+\]", out.combined):
+    # A successful anonymous bind shows a "[+] domain.com\: " line (the same
+    # shape nxc's other modules use for a successful null/anonymous
+    # connection, e.g. "[-] domain.com\: STATUS_ACCESS_DENIED" on failure).
+    # A bare "\[\+\]" anywhere in the buffer is not anchored to this specific
+    # line and could in principle match an unrelated "[+]" success marker
+    # from a different part of nxc's output; requiring the domain-echo shape
+    # ties the match to the actual anonymous-bind-success line.
+    if re.search(r"\[\+\]\s*\S+\\?:\s*$", out.combined, re.MULTILINE):
         result.add_finding(
             Finding(
                 title="LDAP anonymous bind allowed",
@@ -760,9 +766,17 @@ def check_webdav(runner: ToolRunner, target: Target, timeout: int = 180) -> Chec
 
     text = out.combined
     # The webdav module reports when the WebClient service is running, e.g.
-    # "WEBDAV ... WebClient Service enabled on: <host>".
-    enabled = re.search(r"WebClient Service enabled", text, re.IGNORECASE) or re.search(
-        r"\bWEBDAV\b.*enabled", text, re.IGNORECASE
+    # "WEBDAV ... WebClient Service enabled on: <host>". The second
+    # alternative previously matched a bare "\bWEBDAV\b.*enabled" - since
+    # nxc prefixes every line from this module with the protocol tag WEBDAV
+    # (the same way TIMEROAST/SMB prefix other modules' lines), that could
+    # fire from a line where the module's own tag and an unrelated "enabled"
+    # word both happen to appear, without the service actually being
+    # present - the same false-positive shape as the confirmed timeroast
+    # bug. Require the specific "Service ... enabled/running" phrase for
+    # both alternatives instead.
+    enabled = re.search(
+        r"WebClient Service.*(enabled|running)", text, re.IGNORECASE
     )
     if enabled:
         result.add_finding(
@@ -838,8 +852,14 @@ def check_ntlmv1(runner: ToolRunner, target: Target, timeout: int = 120) -> Chec
         return result
 
     text = out.combined
-    # The ntlmv1 module reports e.g. "NTLMv1 allowed / enabled" when vulnerable.
-    if re.search(r"NTLMv1.*(allow|enabl|vulnerab)", text, re.IGNORECASE) or re.search(
+    # The ntlmv1 module reports e.g. "NTLMv1 allowed (LmCompatibilityLevel: 2)"
+    # when vulnerable. The first alternative previously used an unbounded
+    # ".*" with generic verbs (allow/enabl/vulnerab) and no explicit success
+    # token, which could match the module's own description/disclaimer text
+    # independent of the actual result - the same false-positive shape as
+    # the confirmed timeroast bug. Require the specific "NTLMv1 allowed"
+    # status phrase (the module's real positive-result wording) instead.
+    if re.search(r"NTLMv1\s+allowed", text, re.IGNORECASE) or re.search(
         r"LmCompatibilityLevel.*(0|1|2)\b", text, re.IGNORECASE
     ):
         result.add_finding(
@@ -913,8 +933,19 @@ def check_ntlm_reflection(
         return result
 
     text = out.combined
-    if re.search(r"reflection.*(vulnerab|possible|allow)", text, re.IGNORECASE) or re.search(
-        r"\bVULNERABLE\b", text
+    # The second alternative previously matched a bare "\bVULNERABLE\b" with
+    # zero context-binding to the ntlm_reflection module - the loosest
+    # pattern in this file, since "VULNERABLE" appearing anywhere in the
+    # combined buffer (e.g. from a different check sharing the same session,
+    # or the module's own banner) would satisfy it without the module having
+    # reported reflection specifically. Require VULNERABLE to co-occur with
+    # "reflection" on the same line (the module's actual positive-result
+    # line, e.g. "Host is VULNERABLE to NTLM reflection"), the same anchoring
+    # pattern used by check_eternalblue/check_smbghost.
+    if re.search(
+        r"reflection.*(vulnerab|possible|allow)|vulnerab.*reflection",
+        text,
+        re.IGNORECASE,
     ):
         result.add_finding(
             Finding(
@@ -1093,7 +1124,18 @@ def check_cisco_smart_install(
 
     text = out.combined
     open_port = re.search(r"4786/tcp\s+open", text, re.IGNORECASE)
-    smi_active = re.search(r"Smart Install|SMI|is enabled|VULNERABLE", text, re.IGNORECASE)
+    # Previously any one of "Smart Install"/"SMI"/"is enabled"/"VULNERABLE"
+    # alone was accepted - the NSE script's own banner/description line
+    # ("cisco-smart-install:") could plausibly contain "Smart Install" or
+    # "SMI" without an actual positive verdict, and there was no handling for
+    # a negated "Smart Install is NOT enabled" result (contrast with
+    # check_zerologon's explicit "not vulnerable" guard). Require the
+    # script's own "is enabled"/"VULNERABLE" verdict phrase, and explicitly
+    # rule out a negated result.
+    smi_active = re.search(
+        r"(cisco-smart-install|Smart Install|SMI).*(is enabled|VULNERABLE)",
+        text, re.IGNORECASE,
+    ) and not re.search(r"not (enabled|vulnerable)", text, re.IGNORECASE)
     if open_port and smi_active:
         result.add_finding(
             Finding(
@@ -1353,8 +1395,17 @@ def check_anonymous_ftp_nfs(
 
     text = out.combined
     ftp_anon = re.search(r"ftp-anon:.*Anonymous FTP login allowed", text, re.IGNORECASE)
-    nfs_exports = re.search(r"nfs-showmount:", text, re.IGNORECASE) and re.search(
-        r"/\S+", text
+    # Previously the slash-path check (`re.search(r"/\S+", text)`) searched
+    # the WHOLE combined buffer, not just the nfs-showmount script's own
+    # output block - nmap prints the "nfs-showmount:" header whenever the
+    # script runs, regardless of whether any export was actually found, so a
+    # slash-prefixed token appearing ANYWHERE else in nmap's output (a
+    # comment, a URL, an unrelated path) could satisfy this without a real
+    # export existing. Require the slash-path on the line(s) immediately
+    # following the header (nmap indents each script output line with "|"),
+    # not anywhere later in the whole buffer.
+    nfs_exports = re.search(
+        r"nfs-showmount:\n(?:\|[^\n]*\n)*?\|\s*(/\S+)", text, re.IGNORECASE
     )
     found = False
     if ftp_anon:
@@ -1462,7 +1513,18 @@ def check_snmp_default_community(
         re.IGNORECASE | re.DOTALL,
     )
     snmp_open = re.search(r"161/udp\s+open", text, re.IGNORECASE)
-    if community or (snmp_open and re.search(r"snmp-info:", text, re.IGNORECASE)):
+    # The snmp-info fallback previously only required the script's own
+    # "snmp-info:" header to be present (plus the port being open) - nmap
+    # prints that header whenever the script RUNS, independent of whether it
+    # actually received a response (vs. timing out), so this could emit a
+    # finding purely from "port open + script attempted" without any system
+    # information actually having been recovered. Require the header's own
+    # next line to carry actual recovered content (nmap indents script
+    # output lines with "|"), not just the bare header.
+    snmp_info = snmp_open and re.search(
+        r"snmp-info:\s*\n\|\s*\S", text, re.IGNORECASE
+    )
+    if community or snmp_info:
         result.add_finding(
             Finding(
                 title="SNMP accessible with a default/guessable community",
@@ -1621,7 +1683,15 @@ def check_printnightmare(runner: ToolRunner, target: Target, timeout: int = 120)
         return result
 
     text = out.combined
-    spooler_up = re.search(r"spooler.*enabled|Spooler service.*(enabled|running)|PrintNightmare",
+    # The bare "PrintNightmare" alternative previously accepted here is risky:
+    # the nxc "spooler" module exists specifically to probe for
+    # PrintNightmare, so its own help/description text very plausibly
+    # contains that CVE name regardless of whether the spooler was actually
+    # confirmed reachable - the same false-positive shape as the confirmed
+    # timeroast bug. Require the actual "spooler/Spooler service enabled"
+    # status phrase instead, which is what the finding's title is really
+    # about (service reachability, not CVE-name presence).
+    spooler_up = re.search(r"spooler.*enabled|Spooler service.*(enabled|running)",
                            text, re.IGNORECASE)
     if spooler_up:
         result.add_finding(
@@ -1718,17 +1788,26 @@ def check_ipmi_hash_disclosure(
     # ipmi-dumphashes prints "<user>:<hash>" lines; ipmi-version confirms IPMI 2.0.
     hash_dumped = re.search(r"ipmi-dumphashes:.*?:\S{20,}", text, re.IGNORECASE | re.DOTALL)
     ipmi_2 = re.search(r"IPMI-2\.0|IPMI 2\.0", text, re.IGNORECASE)
-    if hash_dumped or ipmi_2:
+    # Protocol-version detection alone (ipmi_2) previously triggered the same
+    # HIGH "hash disclosure" finding as an actually-dumped hash. Running IPMI
+    # 2.0 only confirms the protocol version is in use - it says nothing
+    # about whether the RAKP hash-disclosure issue is actually exploitable
+    # (the BMC could enforce RAKP+HMAC-SHA1 integrity checking that
+    # ipmi-dumphashes fails to bypass, or be patched while still reporting
+    # version 2.0). Only an actually-recovered hash is real evidence of the
+    # CVE-2013-4786 disclosure; demote protocol-version-only detection to a
+    # separate, lower-severity INFO finding with no crackable-hash claim.
+    if hash_dumped:
         result.add_finding(
             Finding(
                 title="IPMI BMC exposes crackable password hash (CVE-2013-4786)",
                 severity=Severity.HIGH,
                 target=target.host,
                 description=(
-                    "An IPMI 2.0 BMC returned (or will return) a salted RAKP "
-                    "password hash to an unauthenticated requester. The hash "
-                    "cracks offline; BMC credentials grant out-of-band server "
-                    "control and are often reused elsewhere."
+                    "An IPMI 2.0 BMC returned a salted RAKP password hash to "
+                    "an unauthenticated requester. The hash cracks offline; "
+                    "BMC credentials grant out-of-band server control and are "
+                    "often reused elsewhere."
                 ),
                 evidence=text[:600],
                 remediation=(
@@ -1756,6 +1835,25 @@ def check_ipmi_hash_disclosure(
                 noise=Noise.QUIET,
                 detail=target.host,
                 source="check",
+            )
+        )
+    elif ipmi_2:
+        result.add_finding(
+            Finding(
+                title="IPMI 2.0 BMC reachable (hash disclosure not confirmed)",
+                severity=Severity.INFO,
+                target=target.host,
+                description=(
+                    "An IPMI 2.0 BMC is reachable on UDP 623, but no RAKP "
+                    "password hash was actually recovered. The BMC may still "
+                    "be vulnerable to CVE-2013-4786; re-run ipmi-dumphashes "
+                    "directly to confirm."
+                ),
+                evidence=text[:600],
+                remediation=(
+                    "Restrict IPMI/BMC (UDP 623) to an isolated management VLAN "
+                    "and confirm whether RAKP hash disclosure is exploitable."
+                ),
             )
         )
     else:

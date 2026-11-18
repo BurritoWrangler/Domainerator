@@ -271,17 +271,34 @@ def check_delegation(runner: ToolRunner, target: Target, timeout: int = 180) -> 
                 ),
             )
         )
-    elif re.search(r"Constrained|delegation", text, re.IGNORECASE):
-        result.add_finding(
-            Finding(
-                title="Delegation configured (review recommended)",
-                severity=Severity.MEDIUM,
-                target=target.domain or target.host,
-                description="Delegation relationships were found and should be reviewed.",
-                evidence=text[:800],
-                remediation="Audit delegation targets and remove where unnecessary.",
-            )
+    else:
+        # A bare "Constrained|delegation" search would also match nxc's own
+        # --find-delegation flag/banner text (which necessarily contains the
+        # word "delegation") regardless of whether any account was actually
+        # found - the same false-positive shape as the confirmed timeroast
+        # bug. Require an actual extracted account name from nxc's per-result
+        # line (nxc prints "<account>  Delegation Type: <Constrained|...>" or
+        # similar per hit) alongside the word "Constrained", so a clean scan
+        # with no delegation relationships is never misreported as a finding.
+        accounts = re.findall(
+            r"(\S+)\s+(?:delegation\s*type|constrained\s*to)\s*[:=]",
+            text,
+            re.IGNORECASE,
         )
+        if accounts and re.search(r"Constrained", text, re.IGNORECASE):
+            result.add_finding(
+                Finding(
+                    title="Delegation configured (review recommended)",
+                    severity=Severity.MEDIUM,
+                    target=target.domain or target.host,
+                    description=(
+                        f"{len(accounts)} account(s) with constrained delegation "
+                        "were found and should be reviewed."
+                    ),
+                    evidence=text[:800],
+                    remediation="Audit delegation targets and remove where unnecessary.",
+                )
+            )
     return result
 
 
@@ -496,6 +513,14 @@ def check_coercion(runner: ToolRunner, target: Target, timeout: int = 180) -> Ch
 
     text = out.combined
     # coerce_plus reports vulnerable methods, e.g. "VULNERABLE" / method names.
+    # The success check must be scoped to the SAME line as each vector's own
+    # pattern match, not the whole buffer: a buffer-wide "vulnerable|coerc"
+    # search would also match the coerce_plus MODULE's own name/description
+    # ("coerc" is a substring of "coerce_plus" itself) appearing anywhere in
+    # the output, independent of whether that specific vector actually
+    # succeeded - the same false-positive shape as the confirmed timeroast
+    # bug, where a bare module-name match satisfied the finding condition.
+    lines = text.splitlines()
     vectors = []
     for label, pat in (
         ("MS-EFSR (PetitPotam)", r"efsr|petitpotam"),
@@ -503,8 +528,14 @@ def check_coercion(runner: ToolRunner, target: Target, timeout: int = 180) -> Ch
         ("MS-DFSNM (DFSCoerce)", r"dfsnm|dfscoerce"),
         ("MS-FSRVP (ShadowCoerce)", r"fsrvp|shadowcoerce"),
     ):
-        if re.search(pat, text, re.IGNORECASE) and re.search(r"vulnerable|coerc", text, re.IGNORECASE):
-            vectors.append(label)
+        for line in lines:
+            if (
+                re.search(pat, line, re.IGNORECASE)
+                and re.search(r"vulnerable", line, re.IGNORECASE)
+                and not re.search(r"not vulnerable", line, re.IGNORECASE)
+            ):
+                vectors.append(label)
+                break
 
     if vectors:
         result.add_finding(
@@ -569,8 +600,20 @@ def check_nopac(runner: ToolRunner, target: Target, timeout: int = 180) -> Check
         return result
 
     text = out.combined
-    # The nopac module indicates vulnerability, e.g. "VULNERABLE" / "got TGT".
-    if re.search(r"vulnerable|nopac.*success|got tgt", text, re.IGNORECASE):
+    # The nopac module's own disclaimer/help text and a negated "not
+    # vulnerable" result line both contain the bare substring "vulnerable", so
+    # a bare search for it (with no anchor to the module/CVE name) can fire
+    # from banner noise alone - the same shape as the confirmed timeroast
+    # false-positive. Require "vulnerable" to co-occur with "nopac" (mirroring
+    # check_eternalblue/check_smbghost's "<module>.*VULNERABLE" pattern) or an
+    # explicit extracted-ticket success phrase, and explicitly rule out a
+    # negated result.
+    vulnerable = (
+        re.search(r"nopac.*vulnerable|vulnerable.*nopac|nopac.*success|got tgt",
+                   text, re.IGNORECASE)
+        and not re.search(r"not vulnerable", text, re.IGNORECASE)
+    )
+    if vulnerable:
         result.add_finding(
             Finding(
                 title="Domain Controller vulnerable to noPac",
@@ -639,10 +682,15 @@ def check_gpp_cpassword(runner: ToolRunner, target: Target, timeout: int = 180) 
         return result
 
     text = out.combined
-    # The module prints recovered "Username: ... Password: ..." pairs. Treat any
-    # recovered credential (or an explicit cpassword hit) as a finding.
+    # The module prints recovered "Username: ... Password: ..." pairs. Treat
+    # any recovered credential (or the explicit "Found credentials" result
+    # phrase) as a finding. Deliberately NOT matching a bare "cpassword" -
+    # that is the XML attribute name the gpp_password module searches for, so
+    # its own description/banner text ("Searching for cpassword in SYSVOL...")
+    # very plausibly contains that word even when nothing was found, which is
+    # the same false-positive shape as the confirmed timeroast bug.
     creds = re.findall(r"[Uu]sername\s*:\s*(\S+).*?[Pp]assword\s*:\s*(\S+)", text, re.DOTALL)
-    if creds or re.search(r"cpassword|Found credentials", text, re.IGNORECASE):
+    if creds or re.search(r"Found credentials", text, re.IGNORECASE):
         users = ", ".join(sorted({u for u, _ in creds}))[:200]
         result.add_finding(
             Finding(
@@ -720,9 +768,17 @@ def check_pre2k_computers(runner: ToolRunner, target: Target, timeout: int = 180
         return result
 
     text = out.combined
-    # The module reports each vulnerable computer account it authenticates as.
-    accounts = re.findall(r"([A-Za-z0-9._-]+\$)", text)
-    if accounts or re.search(r"pre2k|pre-?2000|VULNERABLE", text, re.IGNORECASE):
+    # The module reports each vulnerable computer account it authenticates as,
+    # e.g. "WS01$ is VULNERABLE (pre2k default password)". A bare "[A-Za-z0-9
+    # ._-]+\$" match is too loose (any "$"-suffixed token anywhere in the
+    # buffer, including an unrelated echo), and a bare "pre2k"/"pre-2000"
+    # fallback is the module's own flag/name (`-M pre2k`), virtually
+    # guaranteed to appear in the command echo regardless of outcome - the
+    # same false-positive shape as the confirmed timeroast bug. Require the
+    # account name to be immediately followed by "is VULNERABLE" on the same
+    # match, which is the module's actual per-account positive-result line.
+    accounts = re.findall(r"([A-Za-z0-9._-]+\$)\s+is\s+VULNERABLE", text, re.IGNORECASE)
+    if accounts:
         names = ", ".join(sorted(set(accounts)))[:200]
         result.add_finding(
             Finding(
@@ -801,9 +857,32 @@ def check_laps_readability(
         return result
 
     text = out.combined
-    # The laps module prints recovered "Host: ... Password: ..." pairs.
-    hosts = re.findall(r"([A-Za-z0-9._-]+\$?)\s*[:\-]\s*Password", text, re.IGNORECASE)
-    if hosts or re.search(r"ms-?mcs-?admpwd|laps.*password", text, re.IGNORECASE):
+    # The laps module prints recovered "HOST$: Password: <value>" lines.
+    # Two confirmed false-positive shapes the previous version of this
+    # regex (`[A-Za-z0-9._-]+\$?\s*[:\-]\s*Password`, no required value)
+    # could still match:
+    #   1. nxc's own LDAP bind-success banner line, e.g.
+    #      "[+] domain.com\username:password" - the literal word "password"
+    #      (lowercase, the operator's own supplied credential) right after a
+    #      colon satisfies a case-insensitive "name:Password" search even
+    #      though this has nothing to do with LAPS.
+    #   2. The module's own explicit NEGATIVE result line, e.g. "No result
+    #      found with attribute ms-MCS-AdmPwd or msLAPS-Password !" - the
+    #      hyphen in "msLAPS-Password" satisfies the "[:\-]" separator, so
+    #      "msLAPS-Password" itself gets misread as a "no result found"
+    #      failure being treated as a recovered artifact.
+    # Both are the same false-positive shape as the confirmed timeroast bug:
+    # matching the tool's own echoed/negative text rather than a genuine
+    # recovered secret. Require the specific "<computer$>: Password: <value>"
+    # shape instead - a $-suffixed computer account name (LAPS only applies
+    # to computer accounts), the literal word "Password" with its own colon,
+    # and a non-empty value after it - which the confirmed false positives
+    # above do not produce.
+    hosts = re.findall(
+        r"([A-Za-z0-9._-]+\$)\s*:\s*Password\s*:\s*(\S+)", text, re.IGNORECASE
+    )
+    hosts = [h for h, _ in hosts]
+    if hosts:
         names = ", ".join(sorted(set(hosts)))[:200]
         result.add_finding(
             Finding(

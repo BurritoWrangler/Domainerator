@@ -58,6 +58,17 @@ def test_sccm_discovery_inconclusive_on_unrecognized():
     assert res.inconclusive
 
 
+def test_sccm_discovery_bare_module_name_alone_is_not_a_finding():
+    """Regression: a bare '\\bSCCM\\b' match previously fired from the
+    module's own name (`-M sccm`), virtually guaranteed to appear in the
+    command echo regardless of whether any management point was actually
+    discovered. The module/command echo mentioning "sccm" on its own, with
+    no management point or site code extracted, must not be a finding."""
+    output = "LDAP  10.0.0.10  SCCM  Running sccm module against the domain"
+    res = sccm.check_sccm_discovery(FakeRunner(output), AUTH_TARGET)
+    assert not res.findings
+
+
 def test_sccm_pxe_naa_recovered():
     output = (
         "SMB  10.0.0.10  SCCM  PXE enabled, no password\n"
@@ -98,3 +109,14 @@ def test_sccm_pxe_naa_connection_timed_out_stays_inconclusive():
     )
     assert not res.findings
     assert res.inconclusive
+
+
+def test_sccm_pxe_naa_bare_term_alone_is_not_a_finding():
+    """Regression: a bare '\\bNAA\\b' match previously fired from the
+    module merely describing what it probes for (the term 'NAA' is the
+    standard SCCM terminology the module's own option/description text
+    almost certainly uses), with no credential actually recovered and PXE
+    not confirmed open either."""
+    output = "SMB  10.0.0.10  SCCM  Checking for NAA exposure on this distribution point"
+    res = sccm.check_sccm_pxe_naa(FakeRunner(output), ANON_TARGET)
+    assert not res.findings
