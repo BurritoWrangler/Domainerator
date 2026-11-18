@@ -472,14 +472,35 @@ def main(argv: list[str] | None = None) -> int:
 
     print(report.console_summary(use_color=not args.no_color))
 
+    # Writing the requested report(s) is not allowed to crash with a raw
+    # traceback: a bad --output/--json path (pointing at an existing
+    # directory, an unwritable location, a full disk, etc.) is a user-input
+    # problem, not a bug, so it gets a clear message on stderr instead. The
+    # scan itself already succeeded and its console summary is already
+    # printed, so a write failure here is reported without discarding that
+    # work; the process exits with a distinct code (2, matching other
+    # argument/input errors in this CLI) so automation can detect it.
+    report_write_failed = False
     if args.output:
-        Path(args.output).write_text(
-            report.to_markdown(include_raw=args.include_raw), encoding="utf-8"
-        )
-        print(f"\nMarkdown report written to {args.output}")
+        try:
+            Path(args.output).write_text(
+                report.to_markdown(include_raw=args.include_raw), encoding="utf-8"
+            )
+            print(f"\nMarkdown report written to {args.output}")
+        except OSError as exc:
+            print(f"error: could not write Markdown report to {args.output}: {exc}",
+                  file=sys.stderr)
+            report_write_failed = True
     if args.json_output:
-        Path(args.json_output).write_text(report.to_json(), encoding="utf-8")
-        print(f"JSON report written to {args.json_output}")
+        try:
+            Path(args.json_output).write_text(report.to_json(), encoding="utf-8")
+            print(f"JSON report written to {args.json_output}")
+        except OSError as exc:
+            print(f"error: could not write JSON report to {args.json_output}: {exc}",
+                  file=sys.stderr)
+            report_write_failed = True
+    if report_write_failed and not args.console:
+        return 2
 
     # Evidence capture: per-check command + raw output files for screenshots.
     evidence: EvidenceWriter | None = None
